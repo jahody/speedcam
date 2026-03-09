@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html>
+
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JSFiddle b5Lnkvd1</title>
+
+  <style>
+    
+  </style>
+
+  
+</head>
+<body>
+  <!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>SpeedCam Mobile</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #000;
+  color: #fff;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  overflow: hidden;
+  touch-action: none;
+  height: 100vh;
+  width: 100vw;
+}
+
+#camera-view {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+}
+
+video {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+}
+
+#overlay {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+}
+
+#speed-display {
+  position: absolute;
+  bottom: 40px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0,0,0,0.8);
+  border-radius: 24px;
+  padding: 16px 40px;
+  text-align: center;
+  min-width: 220px;
+  border: 2px solid #333;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+}
+
+#speed-value {
+  font-size: 64px;
+  font-weight: 800;
+  color: #00e676;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+#speed-unit {
+  font-size: 20px;
+  color: #aaa;
+  margin-top: 4px;
+}
+
+#status {
+  position: absolute;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 14px;
+  color: #fff;
+  background: rgba(0,0,0,0.6);
+  padding: 6px 12px;
+  border-radius: 12px;
+  white-space: nowrap;
+}
+
+#controls {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  display: flex;
+  gap: 12px;
+}
+
+.btn {
+  background: rgba(0,0,0,0.7);
+  border: 1px solid #555;
+  color: #fff;
+  padding: 10px 16px;
+  border-radius: 12px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  backdrop-filter: blur(4px);
+  -webkit-tap-highlight-color: transparent;
+}
+.btn:active { background: rgba(255,255,255,0.2); }
+
+#record-count {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  background: rgba(0,0,0,0.7);
+  padding: 10px 16px;
+  border-radius: 12px;
+  font-size: 15px;
+  font-weight: 600;
+  display: none;
+  backdrop-filter: blur(4px);
+}
+
+/* History panel */
+#history-panel {
+  display: none;
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  background: #111;
+  z-index: 100;
+  overflow-y: auto;
+}
+
+#history-panel.visible { display: block; }
+
+#history-header {
+  position: sticky;
+  top: 0;
+  background: #222;
+  padding: 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  z-index: 1;
+  border-bottom: 1px solid #333;
+}
+
+#history-header h2 { font-size: 20px; }
+
+.history-item {
+  display: flex;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid #222;
+  gap: 16px;
+}
+
+.history-item img {
+  width: 90px;
+  height: 68px;
+  object-fit: cover;
+  border-radius: 8px;
+  background: #333;
+}
+
+.history-speed {
+  font-size: 28px;
+  font-weight: bold;
+  color: #00e676;
+}
+
+.history-speed.over-limit { color: #ff1744; }
+
+.history-time {
+  font-size: 13px;
+  color: #888;
+  margin-top: 4px;
+}
+
+.history-empty {
+  text-align: center;
+  padding: 60px 20px;
+  color: #666;
+  font-size: 18px;
+}
+
+/* Settings panel */
+#settings-panel {
+  display: none;
+  position: absolute;
+  bottom: 0; left: 0;
+  width: 100%;
+  background: #1a1a1a;
+  border-radius: 24px 24px 0 0;
+  padding: 24px;
+  z-index: 100;
+  box-shadow: 0 -5px 20px rgba(0,0,0,0.8);
+}
+
+#settings-panel.visible { display: block; }
+
+#settings-panel h3 { margin-bottom: 20px; font-size: 22px; border-bottom: 1px solid #333; padding-bottom: 12px; }
+
+.setting-group { margin-bottom: 20px; }
+
+#settings-panel label {
+  display: block;
+  font-size: 15px;
+  font-weight: 600;
+  color: #eee;
+  margin-bottom: 8px;
+}
+
+#settings-panel input, #settings-panel select {
+  background: #333;
+  border: 1px solid #555;
+  color: #fff;
+  padding: 12px;
+  border-radius: 10px;
+  font-size: 16px;
+  width: 100%;
+  outline: none;
+}
+
+.input-row { display: flex; align-items: center; gap: 12px; }
+.input-row input { width: 120px; }
+
+#settings-panel .hint {
+  font-size: 13px;
+  color: #888;
+  margin-top: 6px;
+  line-height: 1.4;
+}
+
+#settings-backdrop {
+  display: none;
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  background: rgba(0,0,0,0.7);
+  backdrop-filter: blur(2px);
+  z-index: 99;
+}
+
+#settings-backdrop.visible { display: block; }
+
+.close-btn { width: 100%; margin-top: 10px; padding: 14px; background: #00e676; color: #000; border: none; border-radius: 12px; font-size: 18px; font-weight: bold; cursor: pointer; }
+
+/* Loading overlay */
+#loading {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  background: #000;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  z-index: 200;
+}
+
+#loading.hidden { display: none; }
+
+#loading p { margin-top: 20px; font-size: 18px; color: #aaa; }
+
+.spinner {
+  width: 50px; height: 50px;
+  border: 5px solid #333;
+  border-top-color: #00e676;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div id="loading">
+  <div class="spinner"></div>
+  <p id="loading-text">Initializing AI Model...</p>
+</div>
+
+<div id="camera-view">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+
+  <div id="speed-display">
+    <div id="speed-value">--</div>
+    <div id="speed-unit">km/h</div>
+  </div>
+
+  <div id="status">Aim at moving cars</div>
+  <div id="record-count"></div>
+
+  <div id="controls">
+    <button class="btn" id="btn-history">History</button>
+    <button class="btn" id="btn-settings">Settings</button>
+  </div>
+</div>
+
+<div id="history-panel">
+  <div id="history-header">
+    <h2>Speed Log</h2>
+    <div>
+      <button class="btn" id="btn-clear-history">Clear</button>
+      <button class="btn" id="btn-close-history">Close</button>
+    </div>
+  </div>
+  <div id="history-list"></div>
+</div>
+
+<div id="settings-backdrop"></div>
+<div id="settings-panel">
+  <h3>Scanner Settings</h3>
+  
+  <div class="setting-group">
+    <label for="view-mode">Camera Angle (Crucial for accuracy)</label>
+    <select id="view-mode">
+      <option value="side">Side View (Traffic moving left/right)</option>
+      <option value="front">Front View (Traffic moving towards/away)</option>
+    </select>
+    <div class="hint">Adjusts calibration. Cars average 4.5m long but only 1.8m wide.</div>
+  </div>
+
+  <div class="setting-group">
+    <label for="speed-limit-input">Speed Limit Alert Threshold</label>
+    <div class="input-row">
+      <input type="number" id="speed-limit-input" step="5" min="10" max="200" value="50">
+      <span style="color:#eee; font-size:16px;">km/h</span>
+    </div>
+    <div class="hint">Speeds above this limit will be flagged in red.</div>
+  </div>
+
+  <button class="close-btn" id="btn-close-settings">Save & Close</button>
+</div>
+
+<!-- TensorFlow.js + COCO-SSD -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+
+<script>
+// ===== CONFIG =====
+let VIEW_MODE = localStorage.getItem('viewMode') || 'side';
+let SPEED_LIMIT = parseFloat(localStorage.getItem('speedLimit') || '50');
+
+const CAR_LENGTH_M = 4.5;
+const CAR_WIDTH_M = 1.8;
+const MIN_BOX_WIDTH = 50;       
+const MIN_SPEED_KMH = 5;
+const MAX_SPEED_KMH = 180;
+const TRACKING_TIMEOUT_MS = 1500; 
+
+// ===== STATE =====
+let model = null;
+let video, canvas, ctx;
+let isRunning = false;
+
+// Tracking state
+let trackedObject = null; // { history: [{x, y, w, h, time}], finalSpeed: null }
+let records = JSON.parse(localStorage.getItem('speedRecords') || '[]');
+let frameCount = 0;
+let lastFpsTime = performance.now();
+let fps = 0;
+
+document.addEventListener('DOMContentLoaded', init);
+
+async function init() {
+  video = document.getElementById('video');
+  canvas = document.getElementById('overlay');
+  ctx = canvas.getContext('2d');
+
+  // UI bindings
+  document.getElementById('btn-history').onclick = showHistory;
+  document.getElementById('btn-settings').onclick = showSettings;
+  document.getElementById('btn-close-history').onclick = hideHistory;
+  document.getElementById('btn-clear-history').onclick = clearHistory;
+  document.getElementById('btn-close-settings').onclick = hideSettings;
+  document.getElementById('settings-backdrop').onclick = hideSettings;
+
+  document.getElementById('view-mode').value = VIEW_MODE;
+  document.getElementById('speed-limit-input').value = SPEED_LIMIT;
+
+  document.getElementById('view-mode').onchange = (e) => {
+    VIEW_MODE = e.target.value;
+    localStorage.setItem('viewMode', VIEW_MODE);
+  };
+
+  document.getElementById('speed-limit-input').onchange = (e) => {
+    SPEED_LIMIT = parseFloat(e.target.value) || 50;
+    localStorage.setItem('speedLimit', SPEED_LIMIT);
+  };
+
+  updateRecordCount();
+
+  // Start mobile camera
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 }
+      },
+      audio: false
+    });
+    video.srcObject = stream;
+    // Essential for mobile Safari
+    video.setAttribute('playsinline', ''); 
+    await video.play();
+  } catch (err) {
+    document.getElementById('loading-text').textContent = 'Camera blocked. Please allow permissions in your browser.';
+    console.error(err);
+    return;
+  }
+
+  // Load model
+  document.getElementById('loading-text').textContent = 'Loading AI Model...';
+  try {
+    model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+  } catch (err) {
+    document.getElementById('loading-text').textContent = 'Network error loading AI model.';
+    return;
+  }
+
+  resizeCanvas();
+  window.addEventListener('resize', resizeCanvas);
+
+  document.getElementById('loading').classList.add('hidden');
+  isRunning = true;
+  detectLoop();
+}
+
+function resizeCanvas() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+
+async function detectLoop() {
+  if (!isRunning) return;
+  const now = performance.now();
+
+  // Calculate FPS
+  frameCount++;
+  if (now - lastFpsTime >= 1000) {
+    fps = frameCount;
+    frameCount = 0;
+    lastFpsTime = now;
+  }
+
+  // Run AI Detection
+  const predictions = await model.detect(video);
+  
+  // Look for vehicles
+  const vehicles = predictions.filter(p =>
+    ['car', 'truck', 'bus', 'motorcycle'].includes(p.class) && p.score > 0.45
+  );
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  let bestVehicle = null;
+  let maxArea = 0;
+
+  // Scale boxes to canvas and find largest
+  const scaleX = canvas.width / video.videoWidth;
+  const scaleY = canvas.height / video.videoHeight;
+
+  vehicles.forEach(v => {
+    const w = v.bbox[2] * scaleX;
+    const h = v.bbox[3] * scaleY;
+    if (w < MIN_BOX_WIDTH) return;
+    const area = w * h;
+    if (area > maxArea) {
+      maxArea = area;
+      bestVehicle = {
+        x: v.bbox[0] * scaleX,
+        y: v.bbox[1] * scaleY,
+        w: w, h: h,
+        class: v.class
+      };
+    }
+  });
+
+  if (bestVehicle) {
+    const cx = bestVehicle.x + bestVehicle.w / 2;
+    const cy = bestVehicle.y + bestVehicle.h / 2;
+    const currentPoint = { x: cx, y: cy, w: bestVehicle.w, h: bestVehicle.h, time: now };
+
+    // Update tracking
+    if (!trackedObject) {
+      trackedObject = { history: [currentPoint], finalSpeed: null };
+    } else {
+      const lastPoint = trackedObject.history[trackedObject.history.length - 1];
+      const jumpDistance = Math.abs(cx - lastPoint.x);
+      
+      // If centroid jumped more than a full car width, it's probably a new car
+      if (jumpDistance > bestVehicle.w * 1.5) {
+        finalizeAndSave();
+        trackedObject = { history: [currentPoint], finalSpeed: null };
+      } else {
+        trackedObject.history.push(currentPoint);
+        if (trackedObject.history.length > 30) trackedObject.history.shift(); // keep memory small
+      }
+    }
+
+    let calculatedSpeed = null;
+
+    // We need at least a few frames to calculate displacement
+    if (trackedObject.history.length > 5) {
+      // Find a point roughly 400-600ms ago to calculate reliable displacement
+      let oldPoint = trackedObject.history[0];
+      for (let i = trackedObject.history.length - 1; i >= 0; i--) {
+        if (now - trackedObject.history[i].time >= 400) {
+          oldPoint = trackedObject.history[i];
+          break;
+        }
+      }
+
+      const dtSeconds = (now - oldPoint.time) / 1000;
+      
+      // If we have a sufficient time gap (at least 200ms)
+      if (dtSeconds > 0.2) {
+        const dx = cx - oldPoint.x;
+        const dy = cy - oldPoint.y;
+        const pixelDistance = Math.sqrt(dx*dx + dy*dy);
+
+        // Average out the width of the box to stabilize the calibration
+        let avgBoxWidth = 0;
+        trackedObject.history.forEach(p => avgBoxWidth += p.w);
+        avgBoxWidth /= trackedObject.history.length;
+
+        // Determine reference size in meters based on settings
+        const refMeters = (VIEW_MODE === 'side') ? CAR_LENGTH_M : CAR_WIDTH_M;
+        const pixelsPerMeter = avgBoxWidth / refMeters;
+
+        const distanceMeters = pixelDistance / pixelsPerMeter;
+        let instantSpeedKmh = (distanceMeters / dtSeconds) * 3.6;
+
+        if (instantSpeedKmh >= MIN_SPEED_KMH && instantSpeedKmh <= MAX_SPEED_KMH) {
+          // Exponential moving average to smooth the UI jumpiness
+          if (!trackedObject.smoothedSpeed) trackedObject.smoothedSpeed = instantSpeedKmh;
+          else trackedObject.smoothedSpeed = (trackedObject.smoothedSpeed * 0.7) + (instantSpeedKmh * 0.3);
+          
+          calculatedSpeed = trackedObject.smoothedSpeed;
+          trackedObject.finalSpeed = calculatedSpeed; // Keep track of latest valid speed
+        }
+      }
+    }
+
+    // DRAW UI OVERLAY
+    const isOverLimit = calculatedSpeed && calculatedSpeed > SPEED_LIMIT;
+    ctx.strokeStyle = isOverLimit ? '#ff1744' : '#00e676';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(bestVehicle.x, bestVehicle.y, bestVehicle.w, bestVehicle.h);
+
+    if (calculatedSpeed) {
+      document.getElementById('speed-value').textContent = Math.round(calculatedSpeed);
+      document.getElementById('speed-value').style.color = isOverLimit ? '#ff1744' : '#00e676';
+    }
+    
+    document.getElementById('status').textContent = `Tracking ${bestVehicle.class} • ${fps} FPS`;
+
+  } else {
+    // No vehicle seen. Check if we need to save the last tracked vehicle.
+    if (trackedObject) {
+      const lastPoint = trackedObject.history[trackedObject.history.length - 1];
+      if (now - lastPoint.time > TRACKING_TIMEOUT_MS) {
+        finalizeAndSave();
+        trackedObject = null;
+        document.getElementById('speed-value').textContent = '--';
+        document.getElementById('speed-value').style.color = '#00e676';
+        document.getElementById('status').textContent = `Aim at moving cars • ${fps} FPS`;
+      }
+    }
+  }
+
+  requestAnimationFrame(detectLoop);
+}
+
+// ===== SAVE MEASUREMENT =====
+function finalizeAndSave() {
+  if (!trackedObject || !trackedObject.finalSpeed) return;
+  const speed = trackedObject.finalSpeed;
+  if (speed < MIN_SPEED_KMH) return; // Ignore very slow movements
+
+  // Ensure we don't save duplicates from the same tracking burst
+  if (records.length > 0) {
+    const lastRecord = records[0];
+    if (Date.now() - lastRecord.timestamp < 2000) return; 
+  }
+
+  // Capture photo from video directly
+  const captureCanvas = document.createElement('canvas');
+  captureCanvas.width = video.videoWidth;
+  captureCanvas.height = video.videoHeight;
+  const captureCtx = captureCanvas.getContext('2d');
+  captureCtx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
+
+  let photoDataUrl = null;
+  try {
+    photoDataUrl = captureCanvas.toDataURL('image/jpeg', 0.6);
+  } catch (e) {
+    console.warn("Could not grab photo frame.");
+  }
+
+  const record = {
+    speedKmh: Math.round(speed * 10) / 10,
+    timestamp: Date.now(),
+    photo: photoDataUrl
+  };
+
+  records.unshift(record);
+  if (records.length > 50) records = records.slice(0, 50); // limit local storage
+
+  try {
+    localStorage.setItem('speedRecords', JSON.stringify(records));
+  } catch (e) {
+    // if localstorage is full, ditch photos
+    records.forEach(r => r.photo = null);
+    localStorage.setItem('speedRecords', JSON.stringify(records));
+  }
+
+  updateRecordCount();
+}
+
+function updateRecordCount() {
+  const el = document.getElementById('record-count');
+  if (records.length > 0) {
+    el.textContent = `${records.length} Logs`;
+    el.style.display = 'block';
+  } else {
+    el.style.display = 'none';
+  }
+}
+
+// ===== HISTORY =====
+function showHistory() {
+  const panel = document.getElementById('history-panel');
+  const list = document.getElementById('history-list');
+  list.innerHTML = '';
+
+  if (records.length === 0) {
+    list.innerHTML = '<div class="history-empty">No cars logged yet. Aim the camera at moving traffic!</div>';
+  } else {
+    for (const r of records) {
+      const item = document.createElement('div');
+      item.className = 'history-item';
+      const isOver = r.speedKmh > SPEED_LIMIT;
+      const photoHtml = r.photo ? `<img src="${r.photo}" alt="Car capture">` : `<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=" style="background:#333;">`;
+
+      item.innerHTML = `
+        ${photoHtml}
+        <div>
+          <div class="history-speed ${isOver ? 'over-limit' : ''}">${Math.round(r.speedKmh)} km/h</div>
+          <div class="history-time">${formatTime(r.timestamp)}</div>
+        </div>
+      `;
+      list.appendChild(item);
+    }
+  }
+  panel.classList.add('visible');
+}
+
+function hideHistory() {
+  document.getElementById('history-panel').classList.remove('visible');
+}
+
+function clearHistory() {
+  if (confirm('Delete all speed logs?')) {
+    records = [];
+    localStorage.removeItem('speedRecords');
+    updateRecordCount();
+    hideHistory();
+  }
+}
+
+// ===== SETTINGS =====
+function showSettings() {
+  document.getElementById('settings-panel').classList.add('visible');
+  document.getElementById('settings-backdrop').classList.add('visible');
+}
+
+function hideSettings() {
+  document.getElementById('settings-panel').classList.remove('visible');
+  document.getElementById('settings-backdrop').classList.remove('visible');
+}
+
+// ===== UTILS =====
+function formatTime(ts) {
+  const d = new Date(ts);
+  const pad = n => String(n).padStart(2, '0');
+  return `${pad(d.getMonth()+1)}/${pad(d.getDate())} • ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+</script>
+</body>
+</html>
+
+  <script>
+    
+  </script>
+</body>
+</html>
