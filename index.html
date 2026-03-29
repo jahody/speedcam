@@ -309,6 +309,125 @@
         cursor: pointer;
       }
 
+      /* Road name label */
+      #road-name {
+        display: block;
+        font-size: 12px;
+        color: #aaa;
+        margin-top: 4px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 180px;
+        margin: 4px auto 0;
+      }
+
+      /* Calibration status badge */
+      #cal-badge {
+        position: absolute;
+        top: 16px;
+        left: 50%;
+        transform: translateX(-50%);
+        font-size: 12px;
+        background: rgba(0,230,118,0.15);
+        color: #00e676;
+        border: 1px solid #00e676;
+        padding: 4px 10px;
+        border-radius: 8px;
+        display: none;
+      }
+
+      /* Calibration overlay */
+      #cal-overlay {
+        display: none;
+        position: absolute;
+        top: 0; left: 0;
+        width: 100%; height: 100%;
+        background: rgba(0,0,0,0.55);
+        z-index: 150;
+        flex-direction: column;
+        align-items: center;
+        justify-content: flex-start;
+        padding-top: 40px;
+      }
+      #cal-overlay.visible { display: flex; }
+
+      #cal-instruction {
+        background: rgba(0,0,0,0.85);
+        color: #fff;
+        font-size: 17px;
+        font-weight: 600;
+        padding: 14px 24px;
+        border-radius: 14px;
+        text-align: center;
+        max-width: 320px;
+        line-height: 1.4;
+      }
+
+      #cal-tap-canvas {
+        position: absolute;
+        top: 0; left: 0;
+        width: 100%; height: 100%;
+        cursor: crosshair;
+      }
+
+      #cal-distance-picker {
+        display: none;
+        position: absolute;
+        bottom: 0; left: 0; right: 0;
+        background: #1a1a1a;
+        border-radius: 24px 24px 0 0;
+        padding: 24px;
+        z-index: 151;
+      }
+      #cal-distance-picker p {
+        font-size: 16px;
+        font-weight: 600;
+        color: #eee;
+        margin-bottom: 14px;
+      }
+      .cal-presets {
+        display: flex;
+        gap: 10px;
+        margin-bottom: 4px;
+      }
+      .cal-preset {
+        flex: 1;
+        background: #333;
+        border: 2px solid #555;
+        color: #fff;
+        padding: 12px 6px;
+        border-radius: 12px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        text-align: center;
+        line-height: 1.3;
+      }
+      .cal-preset.selected {
+        border-color: #00e676;
+        color: #00e676;
+      }
+
+      /* Toast */
+      #toast {
+        display: none;
+        position: absolute;
+        top: 80px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(0,0,0,0.9);
+        color: #00e676;
+        font-size: 14px;
+        font-weight: 600;
+        padding: 10px 18px;
+        border-radius: 12px;
+        border: 1px solid #00e676;
+        z-index: 300;
+        white-space: nowrap;
+        pointer-events: none;
+      }
+
       /* Loading overlay */
       #loading {
         position: absolute;
@@ -365,6 +484,7 @@
       <div id="speed-display">
         <div id="speed-value">--</div>
         <div id="speed-unit">km/h</div>
+        <span id="road-name"></span>
       </div>
 
       <div id="status">Aim at moving cars</div>
@@ -374,6 +494,8 @@
         <button class="btn" id="btn-history">History</button>
         <button class="btn" id="btn-settings">Settings</button>
       </div>
+
+      <div id="cal-badge">Calibrated ✓</div>
     </div>
 
     <div id="history-panel">
@@ -385,6 +507,29 @@
         </div>
       </div>
       <div id="history-list"></div>
+    </div>
+
+    <!-- Toast notification -->
+    <div id="toast"></div>
+
+    <!-- Calibration overlay -->
+    <div id="cal-overlay">
+      <div id="cal-instruction">Tap point A on the road</div>
+      <canvas id="cal-tap-canvas"></canvas>
+      <div id="cal-distance-picker">
+        <p>Real distance between the two points:</p>
+        <div class="cal-presets">
+          <button class="cal-preset" data-m="3.5">Lane width<br>3.5 m</button>
+          <button class="cal-preset" data-m="3.0">Dashed line<br>3.0 m</button>
+          <button class="cal-preset" data-m="2.5">Parking bay<br>2.5 m</button>
+        </div>
+        <div class="input-row" style="margin-top:12px">
+          <input type="number" id="cal-custom-dist" step="0.1" min="0.5" max="100" placeholder="Custom m">
+          <span style="color:#eee;font-size:16px;">m</span>
+        </div>
+        <button class="close-btn" id="btn-cal-confirm" style="margin-top:14px">Apply Calibration</button>
+        <button class="btn" id="btn-cal-cancel" style="width:100%;margin-top:8px">Cancel</button>
+      </div>
     </div>
 
     <div id="settings-backdrop"></div>
@@ -415,7 +560,23 @@
           <input type="number" id="speed-limit-input" step="5" min="10" max="200" value="50">
           <span style="color:#eee; font-size:16px;">km/h</span>
         </div>
-        <div class="hint">Speeds above this limit will be flagged in red.</div>
+        <div class="hint">Speeds above this limit will be flagged in red. Auto-detected from map data when GPS is available.</div>
+      </div>
+
+      <div class="setting-group">
+        <label>Distance Calibration</label>
+        <div class="hint" style="margin-bottom:10px">Tap two points on the road at a known distance to improve accuracy. Works with any view mode.</div>
+        <div style="display:flex;gap:10px;align-items:center">
+          <button class="btn" id="btn-calibrate" style="flex:1">Calibrate</button>
+          <button class="btn" id="btn-cal-reset" style="flex:1;color:#ff6b6b;border-color:#ff6b6b">Reset</button>
+        </div>
+        <div class="hint" id="cal-status" style="margin-top:8px;color:#888">Not calibrated — using vehicle size estimate</div>
+      </div>
+
+      <div class="setting-group">
+        <label for="mapy-api-key">Mapy.com API Key <span style="font-weight:400;color:#888">(optional)</span></label>
+        <input type="text" id="mapy-api-key" placeholder="Your api.mapy.com key" autocomplete="off" spellcheck="false">
+        <div class="hint">Enables road name display. Free key at <span style="color:#aaa">developer.mapy.com</span></div>
       </div>
 
       <button class="close-btn" id="btn-close-settings">Save & Close</button>
@@ -430,9 +591,14 @@
       let VIEW_MODE = localStorage.getItem('viewMode') || 'side';
       let ROAD_ANGLE = parseFloat(localStorage.getItem('roadAngle') || '0');
       let SPEED_LIMIT = parseFloat(localStorage.getItem('speedLimit') || '50');
+      // Calibrated pixel-to-meter ratio (0 = uncalibrated, use vehicle size estimate)
+      let PIXELS_PER_METER = parseFloat(localStorage.getItem('pixelsPerMeter') || '0');
+      let MAPY_API_KEY = localStorage.getItem('mapyApiKey') || '';
 
-      const CAR_LENGTH_M = 4.5;
-      const CAR_WIDTH_M = 1.8;
+      // Per-vehicle-type average dimensions (meters) used as fallback when uncalibrated
+      const VEHICLE_LENGTHS_M = { car: 4.5, truck: 8.0, bus: 12.0, motorcycle: 2.2 };
+      const VEHICLE_WIDTHS_M  = { car: 1.8, truck: 2.5, bus: 2.5,  motorcycle: 0.8 };
+
       const MIN_BOX_WIDTH = 50;
       const MIN_SPEED_KMH = 5;
       const MAX_SPEED_KMH = 180;
@@ -491,6 +657,22 @@
           localStorage.setItem('speedLimit', SPEED_LIMIT);
         };
 
+        // mapy.com API key
+        document.getElementById('mapy-api-key').value = MAPY_API_KEY;
+        document.getElementById('mapy-api-key').onchange = (e) => {
+          MAPY_API_KEY = e.target.value.trim();
+          localStorage.setItem('mapyApiKey', MAPY_API_KEY);
+        };
+
+        // Calibration buttons
+        document.getElementById('btn-calibrate').onclick = () => { hideSettings(); startCalibrationWizard(); };
+        document.getElementById('btn-cal-reset').onclick = () => {
+          PIXELS_PER_METER = 0;
+          localStorage.removeItem('pixelsPerMeter');
+          updateCalStatus();
+        };
+
+        updateCalStatus();
         updateRecordCount();
 
         // Start mobile camera
@@ -528,6 +710,7 @@
         document.getElementById('loading').classList.add('hidden');
         isRunning = true;
         detectLoop();
+        fetchLocationContext();
       }
 
       function resizeCanvas() {
@@ -641,14 +824,20 @@
                 const dy = cy - oldPoint.y;
                 const pixelDistance = Math.sqrt(dx * dx + dy * dy);
 
-                // Average out the width of the box to stabilize the calibration
-                let avgBoxWidth = 0;
-                trackedObject.history.forEach(p => avgBoxWidth += p.w);
-                avgBoxWidth /= trackedObject.history.length;
+                let ppm;
+                if (PIXELS_PER_METER > 0) {
+                  // Use calibrated ratio directly
+                  ppm = PIXELS_PER_METER;
+                } else {
+                  // Fallback: derive ratio from average bounding box width and vehicle-type length
+                  let avgBoxWidth = 0;
+                  trackedObject.history.forEach(p => avgBoxWidth += p.w);
+                  avgBoxWidth /= trackedObject.history.length;
+                  const vehicleLen = VEHICLE_LENGTHS_M[bestVehicle.class] || 4.5;
+                  ppm = avgBoxWidth / vehicleLen;
+                }
 
-                // Determine reference size in meters based on settings
-                const pixelsPerMeter = avgBoxWidth / CAR_LENGTH_M;
-                const distanceMeters = pixelDistance / pixelsPerMeter;
+                const distanceMeters = pixelDistance / ppm;
 
                 // Calculate speed, then apply cosine correction for camera angle to road
                 const measuredSpeedKmh = (distanceMeters / dtSeconds) * 3.6;
@@ -656,18 +845,16 @@
                 instantSpeedKmh = measuredSpeedKmh / Math.cos(angleRad);
 
               } else {
-                // Front View Logic: use bounding box width to estimate distance
-                // Basic pinhole camera model estimation: Distance = (RealWidth * FocalLengthPixels) / PixelWidth
-                // We assume a phone focal length equivalent. To avoid needing user calibration, 
-                // we'll calculate speed directly from the ratio of widths:
-                // d1 = C / w1, d2 = C / w2 -> speed = (d1 - d2) / dt
-                // C (constant) roughly equals Focal Length (pixels) * CAR_WIDTH_M (m)
-                // A typical phone might have a focal length of ~800 pixels horizontally
-                const FOCAL_LENGTH_PX = 800;
-                const C = FOCAL_LENGTH_PX * CAR_WIDTH_M;
+                // Front View: pinhole camera model — distance inferred from bounding box width change
+                // d = FOCAL_LENGTH_PX * realVehicleWidth / pixelWidth
+                // speed = |d1 - d2| / dt
+                // Uses per-vehicle-type width for better accuracy than a fixed 1.8m for all vehicles
+                const vehicleWidth = VEHICLE_WIDTHS_M[bestVehicle.class] || 1.8;
+                const FOCAL_LENGTH_PX = 800; // typical phone horizontal focal length estimate
+                const C = FOCAL_LENGTH_PX * vehicleWidth;
 
-                const d1 = C / oldPoint.w; // Distance (Meters) at t1
-                const d2 = C / cw;         // Distance (Meters) at t2
+                const d1 = C / oldPoint.w; // estimated distance (m) at t1
+                const d2 = C / cw;         // estimated distance (m) at t2
 
                 const distanceTraveledMeters = Math.abs(d1 - d2);
                 instantSpeedKmh = (distanceTraveledMeters / dtSeconds) * 3.6;
@@ -827,6 +1014,194 @@
         const d = new Date(ts);
         const pad = n => String(n).padStart(2, '0');
         return `${pad(d.getMonth() + 1)}/${pad(d.getDate())} • ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      }
+
+      function showToast(msg) {
+        const el = document.getElementById('toast');
+        el.textContent = msg;
+        el.style.display = 'block';
+        clearTimeout(el._timer);
+        el._timer = setTimeout(() => { el.style.display = 'none'; }, 4000);
+      }
+
+      function updateCalStatus() {
+        const badge = document.getElementById('cal-badge');
+        const statusEl = document.getElementById('cal-status');
+        if (PIXELS_PER_METER > 0) {
+          badge.style.display = 'block';
+          if (statusEl) statusEl.textContent = `Calibrated — ${Math.round(PIXELS_PER_METER)} px/m`;
+        } else {
+          badge.style.display = 'none';
+          if (statusEl) statusEl.textContent = 'Not calibrated — using vehicle size estimate';
+        }
+      }
+
+      // ===== CALIBRATION WIZARD =====
+      function startCalibrationWizard() {
+        const overlay = document.getElementById('cal-overlay');
+        const tapCanvas = document.getElementById('cal-tap-canvas');
+        const instruction = document.getElementById('cal-instruction');
+        const picker = document.getElementById('cal-distance-picker');
+
+        tapCanvas.width = window.innerWidth;
+        tapCanvas.height = window.innerHeight;
+        const tctx = tapCanvas.getContext('2d');
+
+        let tapA = null;
+        let tapB = null;
+        let selectedDist = 3.5;
+
+        // Reset picker state
+        picker.style.display = 'none';
+        instruction.textContent = 'Tap point A on the road';
+        document.querySelectorAll('.cal-preset').forEach(b => b.classList.remove('selected'));
+        document.querySelector('.cal-preset[data-m="3.5"]').classList.add('selected');
+        document.getElementById('cal-custom-dist').value = '';
+
+        overlay.classList.add('visible');
+
+        function drawTaps() {
+          tctx.clearRect(0, 0, tapCanvas.width, tapCanvas.height);
+          [tapA, tapB].forEach((p, i) => {
+            if (!p) return;
+            tctx.beginPath();
+            tctx.arc(p.x, p.y, 14, 0, Math.PI * 2);
+            tctx.fillStyle = i === 0 ? 'rgba(0,230,118,0.8)' : 'rgba(255,214,0,0.8)';
+            tctx.fill();
+            tctx.strokeStyle = '#fff';
+            tctx.lineWidth = 2;
+            tctx.stroke();
+            tctx.fillStyle = '#000';
+            tctx.font = 'bold 14px sans-serif';
+            tctx.textAlign = 'center';
+            tctx.textBaseline = 'middle';
+            tctx.fillText(i === 0 ? 'A' : 'B', p.x, p.y);
+          });
+          if (tapA && tapB) {
+            tctx.beginPath();
+            tctx.moveTo(tapA.x, tapA.y);
+            tctx.lineTo(tapB.x, tapB.y);
+            tctx.strokeStyle = 'rgba(255,255,255,0.6)';
+            tctx.lineWidth = 2;
+            tctx.setLineDash([6, 4]);
+            tctx.stroke();
+            tctx.setLineDash([]);
+          }
+        }
+
+        function onTap(e) {
+          e.preventDefault();
+          const rect = tapCanvas.getBoundingClientRect();
+          const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+          const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+          const x = clientX - rect.left;
+          const y = clientY - rect.top;
+
+          if (!tapA) {
+            tapA = { x, y };
+            instruction.textContent = 'Tap point B on the road';
+            drawTaps();
+          } else if (!tapB) {
+            tapB = { x, y };
+            drawTaps();
+            // Show distance picker
+            picker.style.display = 'block';
+          }
+        }
+
+        tapCanvas.addEventListener('touchstart', onTap, { passive: false });
+        tapCanvas.addEventListener('click', onTap);
+
+        // Preset buttons
+        document.querySelectorAll('.cal-preset').forEach(btn => {
+          btn.onclick = () => {
+            selectedDist = parseFloat(btn.dataset.m);
+            document.querySelectorAll('.cal-preset').forEach(b => b.classList.remove('selected'));
+            btn.classList.add('selected');
+            document.getElementById('cal-custom-dist').value = '';
+          };
+        });
+
+        document.getElementById('cal-custom-dist').oninput = (e) => {
+          const v = parseFloat(e.target.value);
+          if (v > 0) {
+            selectedDist = v;
+            document.querySelectorAll('.cal-preset').forEach(b => b.classList.remove('selected'));
+          }
+        };
+
+        document.getElementById('btn-cal-confirm').onclick = () => {
+          if (!tapA || !tapB) return;
+          const dx = tapB.x - tapA.x;
+          const dy = tapB.y - tapA.y;
+          const pixelDist = Math.sqrt(dx * dx + dy * dy);
+          if (pixelDist < 20) { showToast('Points too close — try again'); return; }
+          PIXELS_PER_METER = pixelDist / selectedDist;
+          localStorage.setItem('pixelsPerMeter', PIXELS_PER_METER);
+          updateCalStatus();
+          closeWizard();
+          showToast(`Calibrated: ${Math.round(PIXELS_PER_METER)} px/m`);
+        };
+
+        document.getElementById('btn-cal-cancel').onclick = closeWizard;
+
+        function closeWizard() {
+          tapCanvas.removeEventListener('touchstart', onTap);
+          tapCanvas.removeEventListener('click', onTap);
+          overlay.classList.remove('visible');
+          picker.style.display = 'none';
+          tctx.clearRect(0, 0, tapCanvas.width, tapCanvas.height);
+        }
+      }
+
+      // ===== GPS + MAPY.COM + OSM =====
+      async function fetchLocationContext() {
+        if (!navigator.geolocation) return;
+        navigator.geolocation.getCurrentPosition(async (pos) => {
+          const { latitude: lat, longitude: lon } = pos.coords;
+          if (MAPY_API_KEY) {
+            try {
+              const res = await fetch(
+                `https://api.mapy.com/v1/rgeocode?lat=${lat}&lon=${lon}&apikey=${encodeURIComponent(MAPY_API_KEY)}`
+              );
+              if (res.ok) {
+                const data = await res.json();
+                const name = data?.items?.[0]?.name || data?.items?.[0]?.label || '';
+                if (name) document.getElementById('road-name').textContent = name;
+              }
+            } catch (e) {
+              console.warn('mapy.com geocoding failed:', e);
+            }
+          }
+          fetchOsmRoadData(lat, lon);
+        }, () => {}, { timeout: 10000 });
+      }
+
+      async function fetchOsmRoadData(lat, lon) {
+        const query = `[out:json];way(around:30,${lat},${lon})[highway];out tags;`;
+        const url = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`;
+        try {
+          const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+          if (!res.ok) return;
+          const data = await res.json();
+          const skip = ['footway', 'path', 'cycleway', 'service', 'track'];
+          const roads = (data.elements || []).filter(e =>
+            e.tags?.highway && !skip.includes(e.tags.highway)
+          );
+          if (roads.length === 0) return;
+          const road = roads[0];
+          if (road.tags?.maxspeed) {
+            const osmLimit = parseInt(road.tags.maxspeed);
+            if (!isNaN(osmLimit) && osmLimit > 0) {
+              SPEED_LIMIT = osmLimit;
+              localStorage.setItem('speedLimit', SPEED_LIMIT);
+              document.getElementById('speed-limit-input').value = SPEED_LIMIT;
+              showToast(`Speed limit set to ${osmLimit} km/h from map data`);
+            }
+          }
+        } catch (e) {
+          console.warn('OSM lookup failed:', e);
+        }
       }
     </script>
   </body>
