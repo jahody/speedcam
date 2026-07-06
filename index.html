@@ -1,23 +1,5 @@
 <!DOCTYPE html>
-<html>
-
-<html>
-
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>JSFiddle b5Lnkvd1</title>
-
-  <style>
-
-  </style>
-
-
-</head>
-
-<body>
-  <!DOCTYPE html>
-  <html lang="en">
+<html lang="en">
 
   <head>
     <meta charset="UTF-8">
@@ -537,6 +519,19 @@
       <h3>Scanner Settings</h3>
 
       <div class="setting-group">
+        <label for="camera-height">Camera Height Above Road</label>
+        <div style="display:flex;gap:10px;margin-bottom:10px">
+          <button class="btn preset-h" data-h="1.5" style="flex:1">Standing 1.5 m</button>
+          <button class="btn preset-h" data-h="5" style="flex:1">Window 5 m</button>
+        </div>
+        <div class="input-row">
+          <input type="number" id="camera-height" step="0.1" min="0.3" max="30" value="1.5">
+          <span style="color:#eee; font-size:16px;">m</span>
+        </div>
+        <div class="hint">Combined with motion sensors this measures real road distances — no car-size guessing. Best within ~15 m when standing; longer range from a window.</div>
+      </div>
+
+      <div class="setting-group" id="view-mode-group">
         <label for="view-mode">Camera Angle (Crucial for accuracy)</label>
         <select id="view-mode">
           <option value="side">Side View (Traffic moving left/right)</option>
@@ -595,6 +590,16 @@
       let PIXELS_PER_METER = parseFloat(localStorage.getItem('pixelsPerMeter') || '0');
       let MAPY_API_KEY = localStorage.getItem('mapyApiKey') || '';
 
+      // IMU ground-plane: camera height above the road surface (meters), entered once by the user
+      let CAMERA_HEIGHT_M = parseFloat(localStorage.getItem('cameraHeight') || '1.5');
+      // Horizontal field of view across the sensor's long side. 70° matches the Pixel 8a main
+      // camera (~80° diagonal at 16:9). Auto-tuned over time from passing cars (see recordFovSample).
+      let FOV_H_DEG = parseFloat(localStorage.getItem('fovHorizontalDeg') || '70');
+      const FOV_MIN_DEG = 55, FOV_MAX_DEG = 85;
+      const MIN_GRAZE_SIN = Math.sin(2 * Math.PI / 180); // rays within 2° of the horizon are unreliable
+      const MAX_GROUND_RANGE_M = 60;
+      const ORIENT_EMA = 0.15;
+
       // Per-vehicle-type average dimensions (meters) used as fallback when uncalibrated
       const VEHICLE_LENGTHS_M = { car: 4.5, truck: 8.0, bus: 12.0, motorcycle: 2.2 };
       const VEHICLE_WIDTHS_M  = { car: 1.8, truck: 2.5, bus: 2.5,  motorcycle: 0.8 };
@@ -612,8 +617,12 @@
       let video, canvas, ctx;
       let isRunning = false;
 
+      // IMU orientation state (radians, EMA-smoothed). needsTap covers the iOS permission flow.
+      let imu = { hasOrientation: false, needsTap: false, beta: 0, gamma: 0 };
+      let fovImpliedSamples = JSON.parse(localStorage.getItem('fovSizeSamples') || '[]');
+
       // Tracking state
-      let trackedObject = null; // { history: [{x, y, w, h, time}], finalSpeed: null }
+      let trackedObject = null; // { history: [{x, y, w, h, time, g}], finalSpeed: null, vehicleClass }
       let records = JSON.parse(localStorage.getItem('speedRecords') || '[]');
       let frameCount = 0;
       let lastFpsTime = performance.now();
@@ -672,6 +681,24 @@
           updateCalStatus();
         };
 
+        // Camera height (ground-plane method)
+        const heightInput = document.getElementById('camera-height');
+        heightInput.value = CAMERA_HEIGHT_M;
+        heightInput.onchange = (e) => {
+          CAMERA_HEIGHT_M = parseFloat(e.target.value) || 1.5;
+          localStorage.setItem('cameraHeight', CAMERA_HEIGHT_M);
+          updateCalStatus();
+        };
+        document.querySelectorAll('.preset-h').forEach(btn => {
+          btn.onclick = () => {
+            CAMERA_HEIGHT_M = parseFloat(btn.dataset.h);
+            heightInput.value = CAMERA_HEIGHT_M;
+            localStorage.setItem('cameraHeight', CAMERA_HEIGHT_M);
+            updateCalStatus();
+          };
+        });
+
+        initOrientation();
         updateCalStatus();
         updateRecordCount();
 
@@ -747,6 +774,9 @@
         const scaleX = canvas.width / video.videoWidth;
         const scaleY = canvas.height / video.videoHeight;
 
+        // Map a canvas-space point back to video pixels and onto the road plane (null when IMU inactive)
+        const groundOf = (px, py) => projectToGround(px / scaleX, py / scaleY);
+
         vehicles.forEach(v => {
           const w = v.bbox[2] * scaleX;
           const h = v.bbox[3] * scaleY;
@@ -770,11 +800,12 @@
           let cw = bestVehicle.w;
           let ch = bestVehicle.h;
 
-          // Update tracking
+          // Update tracking (each point also carries its projected road position g, when available)
           if (!trackedObject) {
             trackedObject = {
-              history: [{ x: cx, y: cy, w: cw, h: ch, time: now }],
-              finalSpeed: null
+              history: [{ x: cx, y: cy, w: cw, h: ch, time: now, g: groundOf(cx, cy + ch / 2) }],
+              finalSpeed: null,
+              vehicleClass: bestVehicle.class
             };
           } else {
             const lastPoint = trackedObject.history[trackedObject.history.length - 1];
@@ -784,8 +815,9 @@
             if (jumpDistance > bestVehicle.w * 1.5) {
               finalizeAndSave();
               trackedObject = {
-                history: [{ x: cx, y: cy, w: cw, h: ch, time: now }],
-                finalSpeed: null
+                history: [{ x: cx, y: cy, w: cw, h: ch, time: now, g: groundOf(cx, cy + ch / 2) }],
+                finalSpeed: null,
+                vehicleClass: bestVehicle.class
               };
             } else {
               // Apply EMA smoothing to the new point
@@ -794,8 +826,9 @@
               cw = (EMA_ALPHA * cw) + ((1 - EMA_ALPHA) * lastPoint.w);
               ch = (EMA_ALPHA * ch) + ((1 - EMA_ALPHA) * lastPoint.h);
 
-              const smoothedPoint = { x: cx, y: cy, w: cw, h: ch, time: now };
+              const smoothedPoint = { x: cx, y: cy, w: cw, h: ch, time: now, g: groundOf(cx, cy + ch / 2) };
               trackedObject.history.push(smoothedPoint);
+              trackedObject.vehicleClass = bestVehicle.class;
               if (trackedObject.history.length > 30) trackedObject.history.shift(); // keep memory small
             }
           }
@@ -817,48 +850,10 @@
 
             // If we have a sufficient time gap (at least 200ms)
             if (dtSeconds > 0.2) {
-              let instantSpeedKmh = 0;
-
-              if (VIEW_MODE === 'side') {
-                const dx = cx - oldPoint.x;
-                const dy = cy - oldPoint.y;
-                const pixelDistance = Math.sqrt(dx * dx + dy * dy);
-
-                let ppm;
-                if (PIXELS_PER_METER > 0) {
-                  // Use calibrated ratio directly
-                  ppm = PIXELS_PER_METER;
-                } else {
-                  // Fallback: derive ratio from average bounding box width and vehicle-type length
-                  let avgBoxWidth = 0;
-                  trackedObject.history.forEach(p => avgBoxWidth += p.w);
-                  avgBoxWidth /= trackedObject.history.length;
-                  const vehicleLen = VEHICLE_LENGTHS_M[bestVehicle.class] || 4.5;
-                  ppm = avgBoxWidth / vehicleLen;
-                }
-
-                const distanceMeters = pixelDistance / ppm;
-
-                // Calculate speed, then apply cosine correction for camera angle to road
-                const measuredSpeedKmh = (distanceMeters / dtSeconds) * 3.6;
-                const angleRad = ROAD_ANGLE * (Math.PI / 180);
-                instantSpeedKmh = measuredSpeedKmh / Math.cos(angleRad);
-
-              } else {
-                // Front View: pinhole camera model — distance inferred from bounding box width change
-                // d = FOCAL_LENGTH_PX * realVehicleWidth / pixelWidth
-                // speed = |d1 - d2| / dt
-                // Uses per-vehicle-type width for better accuracy than a fixed 1.8m for all vehicles
-                const vehicleWidth = VEHICLE_WIDTHS_M[bestVehicle.class] || 1.8;
-                const FOCAL_LENGTH_PX = 800; // typical phone horizontal focal length estimate
-                const C = FOCAL_LENGTH_PX * vehicleWidth;
-
-                const d1 = C / oldPoint.w; // estimated distance (m) at t1
-                const d2 = C / cw;         // estimated distance (m) at t2
-
-                const distanceTraveledMeters = Math.abs(d1 - d2);
-                instantSpeedKmh = (distanceTraveledMeters / dtSeconds) * 3.6;
-              }
+              const newPoint = trackedObject.history[trackedObject.history.length - 1];
+              const est = estimateSpeed(oldPoint, newPoint, dtSeconds, bestVehicle.class, trackedObject.history);
+              const instantSpeedKmh = est ? est.speedKmh : 0;
+              if (est) trackedObject.lastSource = est.source;
 
               if (instantSpeedKmh >= MIN_SPEED_KMH && instantSpeedKmh <= MAX_SPEED_KMH) {
                 // Exponential moving average to smooth the UI jumpiness
@@ -882,7 +877,9 @@
             document.getElementById('speed-value').style.color = isOverLimit ? '#ff1744' : '#00e676';
           }
 
-          document.getElementById('status').textContent = `Tracking ${bestVehicle.class} • ${fps} FPS`;
+          const srcNames = { manual: 'manual cal', imu: 'ground-plane', size: 'size est' };
+          const srcLabel = trackedObject.lastSource ? ` • ${srcNames[trackedObject.lastSource]}` : '';
+          document.getElementById('status').textContent = `Tracking ${bestVehicle.class}${srcLabel} • ${fps} FPS`;
 
         } else {
           // No vehicle seen. Check if we need to save the last tracked vehicle.
@@ -901,9 +898,64 @@
         requestAnimationFrame(detectLoop);
       }
 
+      // ===== SPEED ESTIMATORS =====
+      // Each returns { speedKmh, source } or null. Fusion picks by priority:
+      // manual tap calibration > IMU ground plane > vehicle-size fallback.
+      // (An audio Doppler estimator can slot into this chain later.)
+      function estimateSpeed(oldPoint, newPoint, dtSeconds, vehicleClass, history) {
+        return estimateManual(oldPoint, newPoint, dtSeconds)
+            || estimateGroundPlane(oldPoint, newPoint, dtSeconds)
+            || estimateVehicleSize(oldPoint, newPoint, dtSeconds, vehicleClass, history);
+      }
+
+      function estimateManual(oldPoint, newPoint, dtSeconds) {
+        if (!(PIXELS_PER_METER > 0) || VIEW_MODE !== 'side') return null;
+        const dx = newPoint.x - oldPoint.x;
+        const dy = newPoint.y - oldPoint.y;
+        const distanceMeters = Math.sqrt(dx * dx + dy * dy) / PIXELS_PER_METER;
+        const angleRad = ROAD_ANGLE * (Math.PI / 180);
+        return { speedKmh: (distanceMeters / dtSeconds) * 3.6 / Math.cos(angleRad), source: 'manual' };
+      }
+
+      function estimateGroundPlane(oldPoint, newPoint, dtSeconds) {
+        if (!oldPoint.g || !newPoint.g) return null;
+        const dLat = newPoint.g.lat - oldPoint.g.lat;
+        const dDep = newPoint.g.depth - oldPoint.g.depth;
+        const meters = Math.sqrt(dLat * dLat + dDep * dDep);
+        return { speedKmh: (meters / dtSeconds) * 3.6, source: 'imu' };
+      }
+
+      function estimateVehicleSize(oldPoint, newPoint, dtSeconds, vehicleClass, history) {
+        if (VIEW_MODE === 'side') {
+          const dx = newPoint.x - oldPoint.x;
+          const dy = newPoint.y - oldPoint.y;
+          const pixelDistance = Math.sqrt(dx * dx + dy * dy);
+
+          // Derive scale from average bounding box width and vehicle-type length
+          let avgBoxWidth = 0;
+          history.forEach(p => avgBoxWidth += p.w);
+          avgBoxWidth /= history.length;
+          const vehicleLen = VEHICLE_LENGTHS_M[vehicleClass] || 4.5;
+          const distanceMeters = pixelDistance / (avgBoxWidth / vehicleLen);
+
+          const measuredSpeedKmh = (distanceMeters / dtSeconds) * 3.6;
+          const angleRad = ROAD_ANGLE * (Math.PI / 180);
+          return { speedKmh: measuredSpeedKmh / Math.cos(angleRad), source: 'size' };
+        }
+        // Front view: pinhole camera model — distance inferred from bounding box width change
+        const vehicleWidth = VEHICLE_WIDTHS_M[vehicleClass] || 1.8;
+        const FOCAL_LENGTH_PX = 800; // typical phone horizontal focal length estimate
+        const C = FOCAL_LENGTH_PX * vehicleWidth;
+        const d1 = C / oldPoint.w;
+        const d2 = C / newPoint.w;
+        return { speedKmh: (Math.abs(d1 - d2) / dtSeconds) * 3.6, source: 'size' };
+      }
+
       // ===== SAVE MEASUREMENT =====
       function finalizeAndSave() {
-        if (!trackedObject || !trackedObject.finalSpeed) return;
+        if (!trackedObject) return;
+        recordFovSample(trackedObject);
+        if (!trackedObject.finalSpeed) return;
         const speed = trackedObject.finalSpeed;
         if (speed < MIN_SPEED_KMH) return; // Ignore very slow movements
 
@@ -1027,12 +1079,167 @@
       function updateCalStatus() {
         const badge = document.getElementById('cal-badge');
         const statusEl = document.getElementById('cal-status');
+        const imuReady = imu.hasOrientation && CAMERA_HEIGHT_M > 0;
+
         if (PIXELS_PER_METER > 0) {
           badge.style.display = 'block';
-          if (statusEl) statusEl.textContent = `Calibrated — ${Math.round(PIXELS_PER_METER)} px/m`;
+          badge.textContent = 'Calibrated ✓ (manual)';
+          if (statusEl) statusEl.textContent = `Manual calibration — ${Math.round(PIXELS_PER_METER)} px/m`;
+        } else if (imuReady) {
+          badge.style.display = 'block';
+          badge.textContent = `Ground-plane ✓ h=${CAMERA_HEIGHT_M} m`;
+          if (statusEl) statusEl.textContent = `Ground-plane active — motion sensors + ${CAMERA_HEIGHT_M} m camera height (FOV ${FOV_H_DEG.toFixed(1)}°)`;
+        } else if (imu.needsTap) {
+          badge.style.display = 'block';
+          badge.textContent = 'Tap to enable motion sensors';
+          if (statusEl) statusEl.textContent = 'Motion sensors need permission — tap the badge';
         } else {
           badge.style.display = 'none';
           if (statusEl) statusEl.textContent = 'Not calibrated — using vehicle size estimate';
+        }
+
+        // View-mode and road-angle only matter for the manual/fallback estimators
+        const hideManualGeometry = imuReady && !(PIXELS_PER_METER > 0);
+        const vmGroup = document.getElementById('view-mode-group');
+        const agGroup = document.getElementById('angle-group');
+        if (vmGroup) vmGroup.style.display = hideManualGeometry ? 'none' : 'block';
+        if (agGroup) agGroup.style.display = (hideManualGeometry || VIEW_MODE !== 'side') ? 'none' : 'block';
+      }
+
+      // ===== IMU GROUND-PLANE =====
+      function initOrientation() {
+        // Android Chrome (primary target: Pixel 8a) fires deviceorientation with no permission
+        // prompt. iOS requires an explicit request from a user gesture — the badge is the target.
+        if (typeof DeviceOrientationEvent !== 'undefined' &&
+            typeof DeviceOrientationEvent.requestPermission === 'function') {
+          imu.needsTap = true;
+          const badge = document.getElementById('cal-badge');
+          badge.onclick = () => {
+            DeviceOrientationEvent.requestPermission()
+              .then(state => {
+                if (state === 'granted') { imu.needsTap = false; listenOrientation(); }
+              })
+              .catch(() => {});
+            badge.onclick = null;
+          };
+        } else {
+          listenOrientation();
+        }
+      }
+
+      function listenOrientation() {
+        window.addEventListener('deviceorientation', (e) => {
+          if (e.beta === null || e.gamma === null) return;
+          const b = e.beta * Math.PI / 180;
+          const g = e.gamma * Math.PI / 180;
+          if (!imu.hasOrientation) {
+            imu.beta = b;
+            imu.gamma = g;
+            imu.hasOrientation = true;
+            updateCalStatus();
+          } else {
+            imu.beta += ORIENT_EMA * (b - imu.beta);
+            imu.gamma += ORIENT_EMA * (g - imu.gamma);
+          }
+        });
+      }
+
+      function focalLengthPx() {
+        // FOV_H_DEG spans the sensor's long side, so the focal length in pixels is
+        // resolution-dependent but orientation-independent
+        const longSide = Math.max(video.videoWidth, video.videoHeight) || 1920;
+        return (longSide / 2) / Math.tan((FOV_H_DEG * Math.PI / 180) / 2);
+      }
+
+      // Earth-up unit vector in device coordinates. Derived from the W3C deviceorientation
+      // rotation (Z-X'-Y''); alpha (compass) cancels out, so only beta/gamma are needed.
+      function earthUpInDevice() {
+        const cb = Math.cos(imu.beta), sb = Math.sin(imu.beta);
+        const cg = Math.cos(imu.gamma), sg = Math.sin(imu.gamma);
+        return { x: -sg * cb, y: sb, z: cb * cg };
+      }
+
+      // Map a video pixel to the road plane. Returns { lat, depth, zCam } in meters
+      // (lat = sideways, depth = horizontal distance ahead, zCam = distance along the camera
+      // axis, used for size estimates) or null when the ray is unreliable (near/above horizon,
+      // too far, or no orientation data).
+      function projectToGround(vx, vy) {
+        if (!imu.hasOrientation || !(CAMERA_HEIGHT_M > 0)) return null;
+        const vw = video.videoWidth || 1920, vh = video.videoHeight || 1080;
+        const f = focalLengthPx();
+
+        // Pixel offset from the principal point, up-positive, in screen space
+        const sx = vx - vw / 2;
+        const sy = -(vy - vh / 2);
+        // Screen space -> device space (identity in natural portrait orientation)
+        const a = ((screen.orientation && screen.orientation.angle) || 0) * Math.PI / 180;
+        const ca = Math.cos(a), sa = Math.sin(a);
+        const dxDev = sx * ca - sy * sa;
+        const dyDev = sx * sa + sy * ca;
+
+        // Back camera looks along device -z
+        let rx = dxDev, ry = dyDev, rz = -f;
+        const rn = Math.sqrt(rx * rx + ry * ry + rz * rz);
+        rx /= rn; ry /= rn; rz /= rn;
+
+        const up = earthUpInDevice();
+        const vert = rx * up.x + ry * up.y + rz * up.z;
+        if (vert > -MIN_GRAZE_SIN) return null;
+        const t = CAMERA_HEIGHT_M / (-vert);
+
+        // Horizontal component of the ray and a horizontal basis (forward = camera axis
+        // projected onto the ground, right = up x forward)
+        const hx = rx - vert * up.x, hy = ry - vert * up.y, hz = rz - vert * up.z;
+        const fwx = up.z * up.x, fwy = up.z * up.y, fwz = up.z * up.z - 1;
+        const fm = Math.sqrt(fwx * fwx + fwy * fwy + fwz * fwz);
+        if (fm < 0.1) return null;
+        const e1x = fwx / fm, e1y = fwy / fm, e1z = fwz / fm;
+        const e2x = up.y * e1z - up.z * e1y;
+        const e2y = up.z * e1x - up.x * e1z;
+        const e2z = up.x * e1y - up.y * e1x;
+
+        const depth = t * (hx * e1x + hy * e1y + hz * e1z);
+        const lat = t * (hx * e2x + hy * e2y + hz * e2z);
+        if (depth < 0.5 || Math.sqrt(depth * depth + lat * lat) > MAX_GROUND_RANGE_M) return null;
+        return { lat, depth, zCam: t * (f / rn) };
+      }
+
+      // FOV auto-tune: each finalized side-on car track implies a real car length from its box
+      // width and projected distance. The median over many cars nudges the stored FOV — a
+      // per-device constant that converges once and persists.
+      function recordFovSample(track) {
+        if (track.vehicleClass !== 'car' || PIXELS_PER_METER > 0) return;
+        const pts = track.history.filter(p => p.g);
+        if (pts.length < 6) return;
+        const first = pts[0], last = pts[pts.length - 1];
+        const dLat = Math.abs(last.g.lat - first.g.lat);
+        const dDep = Math.abs(last.g.depth - first.g.depth);
+        if (dLat < dDep * 1.5) return; // only clearly side-on motion shows the car's full length
+
+        const f = focalLengthPx();
+        const scaleX = canvas.width / (video.videoWidth || 1);
+        const longSide = Math.max(video.videoWidth, video.videoHeight) || 1920;
+        // Store the FOV-independent measurement (box width x distance, normalized by
+        // resolution) so past samples stay valid as the FOV estimate changes
+        const qs = pts
+          .map(p => (p.w / scaleX) * p.g.zCam / longSide)
+          .filter(q => { const s = q * longSide / f; return s > 2 && s < 10; })
+          .sort((x, y) => x - y);
+        if (!qs.length) return;
+        const qMed = qs[Math.floor(qs.length / 2)];
+
+        fovImpliedSamples.push(qMed);
+        if (fovImpliedSamples.length > 40) fovImpliedSamples.shift();
+        localStorage.setItem('fovSizeSamples', JSON.stringify(fovImpliedSamples));
+
+        if (fovImpliedSamples.length >= 8) {
+          const sorted = [...fovImpliedSamples].sort((x, y) => x - y);
+          const med = sorted[Math.floor(sorted.length / 2)];
+          // FOV that would make the median car exactly 4.5 m long
+          const target = 2 * Math.atan(4.5 / (2 * med)) * 180 / Math.PI;
+          FOV_H_DEG += 0.2 * (target - FOV_H_DEG);
+          FOV_H_DEG = Math.min(FOV_MAX_DEG, Math.max(FOV_MIN_DEG, FOV_H_DEG));
+          localStorage.setItem('fovHorizontalDeg', FOV_H_DEG);
         }
       }
 
@@ -1203,14 +1410,24 @@
           console.warn('OSM lookup failed:', e);
         }
       }
+
+      // ===== DEBUG HOOK (testing without camera/sensors) =====
+      window.__speedcamDebug = {
+        imu,
+        setOrientation(betaDeg, gammaDeg) {
+          imu.beta = betaDeg * Math.PI / 180;
+          imu.gamma = gammaDeg * Math.PI / 180;
+          imu.hasOrientation = true;
+          updateCalStatus();
+        },
+        setHeight(h) { CAMERA_HEIGHT_M = h; },
+        projectToGround: (x, y) => projectToGround(x, y),
+        estimateGroundPlane: (a, b, dt) => estimateGroundPlane(a, b, dt),
+        recordFovSample: (t) => recordFovSample(t),
+        getFov: () => FOV_H_DEG,
+        setFov(d) { FOV_H_DEG = d; }
+      };
     </script>
   </body>
-
-  </html>
-
-  <script>
-
-  </script>
-</body>
 
 </html>
