@@ -612,6 +612,26 @@
       // EMA smoothing factor (0 = no smoothing, 1 = perfectly smooth but unresponsive)
       const EMA_ALPHA = 0.5;
 
+      // Full-track regression: speed is the least-squares slope of position vs capture time
+      const REG_WINDOW_MS = 1000;       // fit over at most the last second of track
+      const MIN_TRACK_POINTS = 6;       // minimum samples in the fit window
+      const MIN_TRACK_SPAN_S = 0.35;    // minimum time covered by the fit window
+      const MAX_REL_STDERR = 0.3;       // reject live estimates noisier than ±30%
+      const SAVE_MAX_REL_STDERR = 0.25; // don't log measurements noisier than ±25%
+
+      // Optical flow (pyramidal Lucas-Kanade): tracks texture inside the vehicle box so the
+      // measured position doesn't depend on the detection box "breathing"
+      const FLOW_W = 320;          // processing width (video downscaled, grayscale)
+      const FLOW_LEVELS = 3;       // pyramid levels (handles ~30 px/frame motion at FLOW_W)
+      const FLOW_WIN = 7;          // half window: (2*7+1)^2 patch per feature
+      const FLOW_ITERS = 10;       // max LK iterations per level
+      const FLOW_EPS = 0.03;       // convergence threshold (px per iteration)
+      const FLOW_MAX_RESID = 15;   // reject features whose patch changed too much (gray levels)
+      const FLOW_MAX_FEATURES = 24;
+      const FLOW_MIN_FEATURES = 6; // fewer survivors -> fall back to detection centroid
+      const FLOW_BLEND = 0.06;     // slow pull toward detection centroid (kills drift)
+      const FLOW_STALE_MS = 250;   // reset flow when frames stop coming (detection dropout)
+
       // ===== STATE =====
       let model = null;
       let video, canvas, ctx;
@@ -621,8 +641,12 @@
       let imu = { hasOrientation: false, needsTap: false, beta: 0, gamma: 0 };
       let fovImpliedSamples = JSON.parse(localStorage.getItem('fovSizeSamples') || '[]');
 
+      // Optical-flow tracker state (virtual vehicle position in canvas coords)
+      let flow = { prevPyr: null, feats: [], pos: null, lastWall: 0, lastD: { x: 0, y: 0 } };
+      let flowCanvas = null, flowCtx = null;
+
       // Tracking state
-      let trackedObject = null; // { history: [{x, y, w, h, time, g}], finalSpeed: null, vehicleClass }
+      let trackedObject = null; // { history: [{x, y, w, h, t, wall, g}], finalSpeed: null, vehicleClass }
       let records = JSON.parse(localStorage.getItem('speedRecords') || '[]');
       let frameCount = 0;
       let lastFpsTime = performance.now();
@@ -736,7 +760,7 @@
 
         document.getElementById('loading').classList.add('hidden');
         isRunning = true;
-        detectLoop();
+        startDetectLoop();
         fetchLocationContext();
       }
 
@@ -745,16 +769,33 @@
         canvas.height = window.innerHeight;
       }
 
-      async function detectLoop() {
-        if (!isRunning) return;
-        const now = performance.now();
+      function startDetectLoop() {
+        // requestVideoFrameCallback ties each detection to the camera frame's own capture
+        // timestamp (mediaTime); rAF timestamps can be a display frame late or duplicated.
+        const useRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+        const schedule = () => {
+          if (!isRunning) return;
+          if (useRVFC) video.requestVideoFrameCallback(onFrame);
+          else requestAnimationFrame(() => onFrame(null, null));
+        };
+        async function onFrame(_, metadata) {
+          const tCap = metadata ? metadata.mediaTime * 1000 : performance.now();
+          await processFrame(tCap);
+          schedule();
+        }
+        schedule();
+      }
+
+      // tCap: capture time of this frame in ms (media timeline with rVFC, else wall clock)
+      async function processFrame(tCap) {
+        const wall = performance.now();
 
         // Calculate FPS
         frameCount++;
-        if (now - lastFpsTime >= 1000) {
+        if (wall - lastFpsTime >= 1000) {
           fps = frameCount;
           frameCount = 0;
-          lastFpsTime = now;
+          lastFpsTime = wall;
         }
 
         // Run AI Detection
@@ -794,76 +835,66 @@
         });
 
         if (bestVehicle) {
-          // Smooth coordinates with EMA
-          let cx = bestVehicle.x + bestVehicle.w / 2;
-          let cy = bestVehicle.y + bestVehicle.h / 2;
+          const detCx = bestVehicle.x + bestVehicle.w / 2;
+          const detCy = bestVehicle.y + bestVehicle.h / 2;
+
+          // If the centroid jumped more than a full car width, it's probably a new car
+          if (trackedObject) {
+            const lastPoint = trackedObject.history[trackedObject.history.length - 1];
+            if (Math.abs(detCx - lastPoint.x) > bestVehicle.w * 1.5) {
+              finalizeAndSave();
+              trackedObject = null;
+            }
+          }
+          if (!trackedObject) flowReset();
+
+          // Optical flow gives a steadier position than the breathing detection box;
+          // null (no lock yet / too few features) falls back to the detection centroid
+          const flowPos = updateFlow(bestVehicle, detCx, detCy, wall);
+          let cx = flowPos ? flowPos.x : detCx;
+          let cy = flowPos ? flowPos.y : detCy;
           let cw = bestVehicle.w;
           let ch = bestVehicle.h;
 
           // Update tracking (each point also carries its projected road position g, when available)
           if (!trackedObject) {
             trackedObject = {
-              history: [{ x: cx, y: cy, w: cw, h: ch, time: now, g: groundOf(cx, cy + ch / 2) }],
+              history: [{ x: cx, y: cy, w: cw, h: ch, t: tCap, wall, g: groundOf(cx, cy + ch / 2) }],
               finalSpeed: null,
               vehicleClass: bestVehicle.class
             };
           } else {
             const lastPoint = trackedObject.history[trackedObject.history.length - 1];
-            const jumpDistance = Math.abs(cx - lastPoint.x);
-
-            // If centroid jumped more than a full car width, it's probably a new car
-            if (jumpDistance > bestVehicle.w * 1.5) {
-              finalizeAndSave();
-              trackedObject = {
-                history: [{ x: cx, y: cy, w: cw, h: ch, time: now, g: groundOf(cx, cy + ch / 2) }],
-                finalSpeed: null,
-                vehicleClass: bestVehicle.class
-              };
-            } else {
-              // Apply EMA smoothing to the new point
+            // Box size is always EMA-smoothed; position only when flow has no lock
+            if (!flowPos) {
               cx = (EMA_ALPHA * cx) + ((1 - EMA_ALPHA) * lastPoint.x);
               cy = (EMA_ALPHA * cy) + ((1 - EMA_ALPHA) * lastPoint.y);
-              cw = (EMA_ALPHA * cw) + ((1 - EMA_ALPHA) * lastPoint.w);
-              ch = (EMA_ALPHA * ch) + ((1 - EMA_ALPHA) * lastPoint.h);
-
-              const smoothedPoint = { x: cx, y: cy, w: cw, h: ch, time: now, g: groundOf(cx, cy + ch / 2) };
-              trackedObject.history.push(smoothedPoint);
-              trackedObject.vehicleClass = bestVehicle.class;
-              if (trackedObject.history.length > 30) trackedObject.history.shift(); // keep memory small
             }
+            cw = (EMA_ALPHA * cw) + ((1 - EMA_ALPHA) * lastPoint.w);
+            ch = (EMA_ALPHA * ch) + ((1 - EMA_ALPHA) * lastPoint.h);
+
+            trackedObject.history.push({ x: cx, y: cy, w: cw, h: ch, t: tCap, wall, g: groundOf(cx, cy + ch / 2) });
+            trackedObject.vehicleClass = bestVehicle.class;
+            if (trackedObject.history.length > 60) trackedObject.history.shift(); // keep memory small
           }
+          trackedObject.usedFlow = !!flowPos;
 
           let calculatedSpeed = null;
 
-          // We need at least a few frames to calculate displacement
-          if (trackedObject.history.length > 5) {
-            // Find a point roughly 400-600ms ago to calculate reliable displacement
-            let oldPoint = trackedObject.history[0];
-            for (let i = trackedObject.history.length - 1; i >= 0; i--) {
-              if (now - trackedObject.history[i].time >= 400) {
-                oldPoint = trackedObject.history[i];
-                break;
-              }
-            }
+          // Least-squares fit over the recent track window (needs enough points and time span)
+          const pts = trackWindow(trackedObject.history, tCap);
+          const est = pts ? estimateSpeed(pts, trackedObject.vehicleClass) : null;
+          if (est) trackedObject.lastSource = est.source;
 
-            const dtSeconds = (now - oldPoint.time) / 1000;
+          if (est && est.speedKmh >= MIN_SPEED_KMH && est.speedKmh <= MAX_SPEED_KMH &&
+              est.errKmh / est.speedKmh <= MAX_REL_STDERR) {
+            // Light EMA on top of the regression to keep the display steady
+            if (!trackedObject.smoothedSpeed) trackedObject.smoothedSpeed = est.speedKmh;
+            else trackedObject.smoothedSpeed = (trackedObject.smoothedSpeed * 0.7) + (est.speedKmh * 0.3);
 
-            // If we have a sufficient time gap (at least 200ms)
-            if (dtSeconds > 0.2) {
-              const newPoint = trackedObject.history[trackedObject.history.length - 1];
-              const est = estimateSpeed(oldPoint, newPoint, dtSeconds, bestVehicle.class, trackedObject.history);
-              const instantSpeedKmh = est ? est.speedKmh : 0;
-              if (est) trackedObject.lastSource = est.source;
-
-              if (instantSpeedKmh >= MIN_SPEED_KMH && instantSpeedKmh <= MAX_SPEED_KMH) {
-                // Exponential moving average to smooth the UI jumpiness
-                if (!trackedObject.smoothedSpeed) trackedObject.smoothedSpeed = instantSpeedKmh;
-                else trackedObject.smoothedSpeed = (trackedObject.smoothedSpeed * 0.7) + (instantSpeedKmh * 0.3);
-
-                calculatedSpeed = trackedObject.smoothedSpeed;
-                trackedObject.finalSpeed = calculatedSpeed; // Keep track of latest valid speed
-              }
-            }
+            calculatedSpeed = trackedObject.smoothedSpeed;
+            trackedObject.finalSpeed = calculatedSpeed; // Keep track of latest valid speed
+            trackedObject.finalErr = est.errKmh;
           }
 
           // DRAW UI OVERLAY
@@ -875,80 +906,358 @@
           if (calculatedSpeed) {
             document.getElementById('speed-value').textContent = Math.round(calculatedSpeed);
             document.getElementById('speed-value').style.color = isOverLimit ? '#ff1744' : '#00e676';
+            document.getElementById('speed-unit').textContent =
+              `km/h ±${Math.max(1, Math.round(trackedObject.finalErr))}`;
           }
 
           const srcNames = { manual: 'manual cal', imu: 'ground-plane', size: 'size est' };
           const srcLabel = trackedObject.lastSource ? ` • ${srcNames[trackedObject.lastSource]}` : '';
-          document.getElementById('status').textContent = `Tracking ${bestVehicle.class}${srcLabel} • ${fps} FPS`;
+          const flowLabel = trackedObject.usedFlow ? ' • flow' : '';
+          document.getElementById('status').textContent = `Tracking ${bestVehicle.class}${srcLabel}${flowLabel} • ${fps} FPS`;
 
         } else {
           // No vehicle seen. Check if we need to save the last tracked vehicle.
           if (trackedObject) {
             const lastPoint = trackedObject.history[trackedObject.history.length - 1];
-            if (now - lastPoint.time > TRACKING_TIMEOUT_MS) {
+            if (wall - lastPoint.wall > TRACKING_TIMEOUT_MS) {
               finalizeAndSave();
               trackedObject = null;
+              flowReset();
               document.getElementById('speed-value').textContent = '--';
               document.getElementById('speed-value').style.color = '#00e676';
+              document.getElementById('speed-unit').textContent = 'km/h';
               document.getElementById('status').textContent = `Aim at moving cars • ${fps} FPS`;
             }
           }
         }
-
-        requestAnimationFrame(detectLoop);
       }
 
       // ===== SPEED ESTIMATORS =====
-      // Each returns { speedKmh, source } or null. Fusion picks by priority:
+      // Each estimator least-squares-fits position against capture time over the recent
+      // track window and returns { speedKmh, errKmh, source } or null. errKmh is the fit's
+      // standard error propagated to speed. Fusion picks by priority:
       // manual tap calibration > IMU ground plane > vehicle-size fallback.
       // (An audio Doppler estimator can slot into this chain later.)
-      function estimateSpeed(oldPoint, newPoint, dtSeconds, vehicleClass, history) {
-        return estimateManual(oldPoint, newPoint, dtSeconds)
-            || estimateGroundPlane(oldPoint, newPoint, dtSeconds)
-            || estimateVehicleSize(oldPoint, newPoint, dtSeconds, vehicleClass, history);
+
+      // Recent points suitable for fitting, or null when the track is too short/brief
+      function trackWindow(history, tNow) {
+        const pts = history.filter(p => tNow - p.t <= REG_WINDOW_MS);
+        if (pts.length < MIN_TRACK_POINTS) return null;
+        if (pts[pts.length - 1].t - pts[0].t < MIN_TRACK_SPAN_S * 1000) return null;
+        return pts;
       }
 
-      function estimateManual(oldPoint, newPoint, dtSeconds) {
+      // Least-squares slope of v against t, with the slope's standard error
+      function linFit(ts, vs) {
+        const n = ts.length;
+        let tm = 0, vm = 0;
+        for (let i = 0; i < n; i++) { tm += ts[i]; vm += vs[i]; }
+        tm /= n; vm /= n;
+        let stt = 0, stv = 0;
+        for (let i = 0; i < n; i++) {
+          const dt = ts[i] - tm;
+          stt += dt * dt;
+          stv += dt * (vs[i] - vm);
+        }
+        if (stt < 1e-9) return null;
+        const slope = stv / stt;
+        let ssr = 0;
+        for (let i = 0; i < n; i++) {
+          const r = (vs[i] - vm) - slope * (ts[i] - tm);
+          ssr += r * r;
+        }
+        const se = Math.sqrt(ssr / Math.max(1, n - 2) / stt);
+        return { slope, se };
+      }
+
+      // 2D speed (m/s) from independent x(t), y(t) fits; error combined via delta method
+      function fitSpeed2D(pts, getX, getY) {
+        const ts = pts.map(p => p.t / 1000);
+        const fx = linFit(ts, pts.map(getX));
+        const fy = linFit(ts, pts.map(getY));
+        if (!fx || !fy) return null;
+        const v = Math.hypot(fx.slope, fy.slope);
+        const se = v > 1e-6
+          ? Math.hypot(fx.slope * fx.se, fy.slope * fy.se) / v
+          : Math.hypot(fx.se, fy.se);
+        return { v, se };
+      }
+
+      function estimateSpeed(pts, vehicleClass) {
+        return estimateManual(pts)
+            || estimateGroundPlane(pts)
+            || estimateVehicleSize(pts, vehicleClass);
+      }
+
+      function estimateManual(pts) {
         if (!(PIXELS_PER_METER > 0) || VIEW_MODE !== 'side') return null;
-        const dx = newPoint.x - oldPoint.x;
-        const dy = newPoint.y - oldPoint.y;
-        const distanceMeters = Math.sqrt(dx * dx + dy * dy) / PIXELS_PER_METER;
-        const angleRad = ROAD_ANGLE * (Math.PI / 180);
-        return { speedKmh: (distanceMeters / dtSeconds) * 3.6 / Math.cos(angleRad), source: 'manual' };
+        const fit = fitSpeed2D(pts, p => p.x / PIXELS_PER_METER, p => p.y / PIXELS_PER_METER);
+        if (!fit) return null;
+        const cosA = Math.cos(ROAD_ANGLE * Math.PI / 180);
+        return { speedKmh: fit.v * 3.6 / cosA, errKmh: fit.se * 3.6 / cosA, source: 'manual' };
       }
 
-      function estimateGroundPlane(oldPoint, newPoint, dtSeconds) {
-        if (!oldPoint.g || !newPoint.g) return null;
-        const dLat = newPoint.g.lat - oldPoint.g.lat;
-        const dDep = newPoint.g.depth - oldPoint.g.depth;
-        const meters = Math.sqrt(dLat * dLat + dDep * dDep);
-        return { speedKmh: (meters / dtSeconds) * 3.6, source: 'imu' };
+      function estimateGroundPlane(pts) {
+        const gp = pts.filter(p => p.g);
+        if (gp.length < MIN_TRACK_POINTS ||
+            gp[gp.length - 1].t - gp[0].t < MIN_TRACK_SPAN_S * 1000) return null;
+        const fit = fitSpeed2D(gp, p => p.g.lat, p => p.g.depth);
+        if (!fit) return null;
+        return { speedKmh: fit.v * 3.6, errKmh: fit.se * 3.6, source: 'imu' };
       }
 
-      function estimateVehicleSize(oldPoint, newPoint, dtSeconds, vehicleClass, history) {
+      function estimateVehicleSize(pts, vehicleClass) {
         if (VIEW_MODE === 'side') {
-          const dx = newPoint.x - oldPoint.x;
-          const dy = newPoint.y - oldPoint.y;
-          const pixelDistance = Math.sqrt(dx * dx + dy * dy);
-
           // Derive scale from average bounding box width and vehicle-type length
           let avgBoxWidth = 0;
-          history.forEach(p => avgBoxWidth += p.w);
-          avgBoxWidth /= history.length;
-          const vehicleLen = VEHICLE_LENGTHS_M[vehicleClass] || 4.5;
-          const distanceMeters = pixelDistance / (avgBoxWidth / vehicleLen);
-
-          const measuredSpeedKmh = (distanceMeters / dtSeconds) * 3.6;
-          const angleRad = ROAD_ANGLE * (Math.PI / 180);
-          return { speedKmh: measuredSpeedKmh / Math.cos(angleRad), source: 'size' };
+          pts.forEach(p => avgBoxWidth += p.w);
+          avgBoxWidth /= pts.length;
+          if (!(avgBoxWidth > 0)) return null;
+          const metersPerPx = (VEHICLE_LENGTHS_M[vehicleClass] || 4.5) / avgBoxWidth;
+          const fit = fitSpeed2D(pts, p => p.x * metersPerPx, p => p.y * metersPerPx);
+          if (!fit) return null;
+          const cosA = Math.cos(ROAD_ANGLE * Math.PI / 180);
+          return { speedKmh: fit.v * 3.6 / cosA, errKmh: fit.se * 3.6 / cosA, source: 'size' };
         }
-        // Front view: pinhole camera model — distance inferred from bounding box width change
+        // Front view: pinhole camera model — per-frame distance from box width, fit distance vs time
         const vehicleWidth = VEHICLE_WIDTHS_M[vehicleClass] || 1.8;
         const FOCAL_LENGTH_PX = 800; // typical phone horizontal focal length estimate
         const C = FOCAL_LENGTH_PX * vehicleWidth;
-        const d1 = C / oldPoint.w;
-        const d2 = C / newPoint.w;
-        return { speedKmh: (Math.abs(d1 - d2) / dtSeconds) * 3.6, source: 'size' };
+        const fit = linFit(pts.map(p => p.t / 1000), pts.map(p => C / p.w));
+        if (!fit) return null;
+        return { speedKmh: Math.abs(fit.slope) * 3.6, errKmh: fit.se * 3.6, source: 'size' };
+      }
+
+      // ===== OPTICAL FLOW (pyramidal Lucas-Kanade) =====
+      // COCO-SSD's box jitters ("breathes") as the car's aspect changes, polluting a
+      // centroid-based track. Flow instead tracks actual texture inside the box between
+      // consecutive frames at reduced resolution; the median feature displacement advances
+      // a virtual vehicle position, blended slowly toward the detection centroid so
+      // integration drift can't accumulate.
+
+      function flowReset() {
+        flow.prevPyr = null;
+        flow.feats = [];
+        flow.pos = null;
+        flow.lastD = { x: 0, y: 0 }; // last median displacement — velocity prior for LK
+      }
+
+      function grayPyramid() {
+        const vw = video.videoWidth, vh = video.videoHeight;
+        const s = FLOW_W / vw;
+        const w0 = FLOW_W, h0 = Math.max(16, Math.round(vh * s));
+        if (!flowCanvas) {
+          flowCanvas = document.createElement('canvas');
+          flowCtx = flowCanvas.getContext('2d', { willReadFrequently: true });
+        }
+        if (flowCanvas.width !== w0 || flowCanvas.height !== h0) {
+          flowCanvas.width = w0;
+          flowCanvas.height = h0;
+        }
+        flowCtx.drawImage(video, 0, 0, w0, h0);
+        return pyramidFromCanvas(flowCtx, w0, h0);
+      }
+
+      function pyramidFromCanvas(sctx, w0, h0) {
+        const img = sctx.getImageData(0, 0, w0, h0).data;
+        const g = new Float32Array(w0 * h0);
+        for (let i = 0, j = 0; i < g.length; i++, j += 4) {
+          g[i] = 0.299 * img[j] + 0.587 * img[j + 1] + 0.114 * img[j + 2];
+        }
+        const levels = [{ w: w0, h: h0, d: g }];
+        for (let l = 1; l < FLOW_LEVELS; l++) {
+          const p = levels[l - 1];
+          const w = p.w >> 1, h = p.h >> 1;
+          const d = new Float32Array(w * h);
+          for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+              const i2 = (2 * y) * p.w + 2 * x;
+              d[y * w + x] = (p.d[i2] + p.d[i2 + 1] + p.d[i2 + p.w] + p.d[i2 + p.w + 1]) * 0.25;
+            }
+          }
+          levels.push({ w, h, d });
+        }
+        return levels;
+      }
+
+      // Bilinear sample; caller guarantees (x, y) is at least 1px inside the image
+      function sampleGray(im, x, y) {
+        const x0 = Math.floor(x), y0 = Math.floor(y);
+        const fx = x - x0, fy = y - y0;
+        const i = y0 * im.w + x0;
+        const d = im.d;
+        return d[i] * (1 - fx) * (1 - fy) + d[i + 1] * fx * (1 - fy) +
+               d[i + im.w] * (1 - fx) * fy + d[i + im.w + 1] * fx * fy;
+      }
+
+      // Track one feature from prevPyr to currPyr (coarse-to-fine iterative LK).
+      // initDx/initDy: displacement prior in level-0 px (previous frame's median motion),
+      // which lets LK lock onto motion larger than the pyramid alone can handle.
+      // Returns the new position { x, y } or null when tracking is unreliable.
+      function lkTrack(prevPyr, currPyr, px, py, initDx = 0, initDy = 0) {
+        const n = (2 * FLOW_WIN + 1) ** 2;
+        const Ix = new Float32Array(n), Iy = new Float32Array(n), I0 = new Float32Array(n);
+        const topScale = 1 << (FLOW_LEVELS - 1);
+        let dx = initDx / topScale, dy = initDy / topScale;
+        for (let l = FLOW_LEVELS - 1; l >= 0; l--) {
+          const P = prevPyr[l], C = currPyr[l];
+          const x = px / (1 << l), y = py / (1 << l);
+          const m = FLOW_WIN + 2;
+          if (x < m || y < m || x >= P.w - m || y >= P.h - m) return null;
+
+          // Gradient structure matrix of the template patch (previous frame)
+          let gxx = 0, gxy = 0, gyy = 0, k = 0;
+          for (let j = -FLOW_WIN; j <= FLOW_WIN; j++) {
+            for (let i = -FLOW_WIN; i <= FLOW_WIN; i++, k++) {
+              const sx = x + i, sy = y + j;
+              const ix = (sampleGray(P, sx + 1, sy) - sampleGray(P, sx - 1, sy)) * 0.5;
+              const iy = (sampleGray(P, sx, sy + 1) - sampleGray(P, sx, sy - 1)) * 0.5;
+              Ix[k] = ix; Iy[k] = iy; I0[k] = sampleGray(P, sx, sy);
+              gxx += ix * ix; gxy += ix * iy; gyy += iy * iy;
+            }
+          }
+          const det = gxx * gyy - gxy * gxy;
+          if (det < 1) return null; // untextured patch — aperture problem
+
+          for (let it = 0; it < FLOW_ITERS; it++) {
+            const cx = x + dx, cy = y + dy;
+            if (cx < m || cy < m || cx >= C.w - m || cy >= C.h - m) return null;
+            let bx = 0, by = 0;
+            k = 0;
+            for (let j = -FLOW_WIN; j <= FLOW_WIN; j++) {
+              for (let i = -FLOW_WIN; i <= FLOW_WIN; i++, k++) {
+                const dI = I0[k] - sampleGray(C, cx + i, cy + j);
+                bx += dI * Ix[k]; by += dI * Iy[k];
+              }
+            }
+            const ux = (gyy * bx - gxy * by) / det;
+            const uy = (gxx * by - gxy * bx) / det;
+            dx += ux; dy += uy;
+            if (ux * ux + uy * uy < FLOW_EPS * FLOW_EPS) break;
+          }
+
+          if (l > 0) {
+            dx *= 2; dy *= 2; // propagate the estimate to the next finer level
+          } else {
+            // Reject features whose neighborhood no longer matches (occlusion, bad lock)
+            const cx = x + dx, cy = y + dy;
+            if (cx < m || cy < m || cx >= C.w - m || cy >= C.h - m) return null;
+            let resid = 0;
+            k = 0;
+            for (let j = -FLOW_WIN; j <= FLOW_WIN; j++) {
+              for (let i = -FLOW_WIN; i <= FLOW_WIN; i++, k++) {
+                resid += Math.abs(I0[k] - sampleGray(C, cx + i, cy + j));
+              }
+            }
+            if (resid / n > FLOW_MAX_RESID) return null;
+          }
+        }
+        return { x: px + dx, y: py + dy };
+      }
+
+      // Shi-Tomasi-style corners on a coarse grid inside the (flow-space) box
+      function detectFeatures(pyr, box) {
+        const P = pyr[0];
+        const m = FLOW_WIN + 3;
+        const x0 = Math.max(m, Math.round(box.x)), x1 = Math.min(P.w - m, Math.round(box.x + box.w));
+        const y0 = Math.max(m, Math.round(box.y)), y1 = Math.min(P.h - m, Math.round(box.y + box.h));
+        const cands = [];
+        for (let y = y0; y < y1; y += 3) {
+          for (let x = x0; x < x1; x += 3) {
+            let gxx = 0, gxy = 0, gyy = 0;
+            for (let j = -2; j <= 2; j++) {
+              for (let i = -2; i <= 2; i++) {
+                const idx = (y + j) * P.w + x + i;
+                const ix = (P.d[idx + 1] - P.d[idx - 1]) * 0.5;
+                const iy = (P.d[idx + P.w] - P.d[idx - P.w]) * 0.5;
+                gxx += ix * ix; gxy += ix * iy; gyy += iy * iy;
+              }
+            }
+            const tr = gxx + gyy;
+            const det = gxx * gyy - gxy * gxy;
+            const lmin = tr / 2 - Math.sqrt(Math.max(0, tr * tr / 4 - det));
+            if (lmin > 25) cands.push({ x, y, q: lmin });
+          }
+        }
+        cands.sort((a, b) => b.q - a.q);
+        // Greedily keep the strongest corners with minimum spacing
+        const out = [];
+        for (const c of cands) {
+          if (out.length >= FLOW_MAX_FEATURES) break;
+          let ok = true;
+          for (const o of out) {
+            const ddx = c.x - o.x, ddy = c.y - o.y;
+            if (ddx * ddx + ddy * ddy < 64) { ok = false; break; }
+          }
+          if (ok) out.push({ x: c.x, y: c.y });
+        }
+        return out;
+      }
+
+      // Advance the flow tracker one frame. boxCanvas is the detection box in canvas coords.
+      // Returns the flow-tracked vehicle position (canvas coords) or null when flow has no
+      // lock this frame (caller falls back to the detection centroid).
+      function updateFlow(boxCanvas, detCx, detCy, wall) {
+        const vw = video.videoWidth, vh = video.videoHeight;
+        if (!vw || !vh) return null;
+        if (wall - flow.lastWall > FLOW_STALE_MS) flowReset(); // frames stopped: features stale
+        flow.lastWall = wall;
+
+        const curr = grayPyramid();
+        const s = FLOW_W / vw;
+        const scaleX = canvas.width / vw, scaleY = canvas.height / vh;
+        // Detection box in flow space, shrunk 10% to avoid seeding on background
+        const bx = boxCanvas.x / scaleX * s, by = boxCanvas.y / scaleY * s;
+        const bw = boxCanvas.w / scaleX * s, bh = boxCanvas.h / scaleY * s;
+        const fbox = { x: bx + bw * 0.05, y: by + bh * 0.05, w: bw * 0.9, h: bh * 0.9 };
+
+        let result = null;
+        if (flow.prevPyr && flow.feats.length) {
+          const moved = [];
+          const dxs = [], dys = [];
+          for (const f of flow.feats) {
+            const r = lkTrack(flow.prevPyr, curr, f.x, f.y, flow.lastD.x, flow.lastD.y);
+            if (r) { moved.push(r); dxs.push(r.x - f.x); dys.push(r.y - f.y); }
+          }
+          // Consensus: only trust the frame if enough features agree on one motion
+          let inliers = 0, mdx = 0, mdy = 0;
+          if (moved.length) {
+            mdx = median(dxs); mdy = median(dys);
+            const tol = 2 + 0.15 * Math.hypot(mdx, mdy);
+            for (let i = 0; i < dxs.length; i++) {
+              if (Math.hypot(dxs[i] - mdx, dys[i] - mdy) <= tol) inliers++;
+            }
+          }
+          if (inliers >= FLOW_MIN_FEATURES && flow.pos) {
+            // Median displacement is robust to background points caught inside the box
+            flow.lastD = { x: mdx, y: mdy };
+            flow.pos.x += mdx / s * scaleX;
+            flow.pos.y += mdy / s * scaleY;
+            // Slow blend toward the detection centroid prevents long-term drift
+            flow.pos.x += FLOW_BLEND * (detCx - flow.pos.x);
+            flow.pos.y += FLOW_BLEND * (detCy - flow.pos.y);
+            result = { x: flow.pos.x, y: flow.pos.y };
+            // Drop features the vehicle has left behind
+            flow.feats = moved.filter(f =>
+              f.x >= fbox.x && f.x <= fbox.x + fbox.w && f.y >= fbox.y && f.y <= fbox.y + fbox.h);
+          } else {
+            flow.feats = [];
+            flow.lastD = { x: 0, y: 0 };
+          }
+        }
+
+        if (flow.feats.length < FLOW_MAX_FEATURES / 2) {
+          flow.feats = detectFeatures(curr, fbox);
+        }
+        if (!flow.pos) flow.pos = { x: detCx, y: detCy };
+        flow.prevPyr = curr;
+        return result;
+      }
+
+      function median(arr) {
+        const s = [...arr].sort((a, b) => a - b);
+        const m = s.length >> 1;
+        return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
       }
 
       // ===== SAVE MEASUREMENT =====
@@ -958,6 +1267,8 @@
         if (!trackedObject.finalSpeed) return;
         const speed = trackedObject.finalSpeed;
         if (speed < MIN_SPEED_KMH) return; // Ignore very slow movements
+        // Quality gate: don't log measurements whose fit was too noisy
+        if (trackedObject.finalErr && trackedObject.finalErr / speed > SAVE_MAX_REL_STDERR) return;
 
         // Ensure we don't save duplicates from the same tracking burst
         if (records.length > 0) {
@@ -981,6 +1292,7 @@
 
         const record = {
           speedKmh: Math.round(speed * 10) / 10,
+          errKmh: trackedObject.finalErr ? Math.round(trackedObject.finalErr * 10) / 10 : null,
           timestamp: Date.now(),
           photo: photoDataUrl
         };
@@ -1027,7 +1339,7 @@
             item.innerHTML = `
         ${photoHtml}
         <div>
-          <div class="history-speed ${isOver ? 'over-limit' : ''}">${Math.round(r.speedKmh)} km/h</div>
+          <div class="history-speed ${isOver ? 'over-limit' : ''}">${Math.round(r.speedKmh)} km/h${r.errKmh ? ` <span style="font-size:14px;color:#888">±${Math.max(1, Math.round(r.errKmh))}</span>` : ''}</div>
           <div class="history-time">${formatTime(r.timestamp)}</div>
         </div>
       `;
@@ -1421,11 +1733,23 @@
           updateCalStatus();
         },
         setHeight(h) { CAMERA_HEIGHT_M = h; },
+        setPpm(p) { PIXELS_PER_METER = p; updateCalStatus(); },
+        setViewMode(m) { VIEW_MODE = m; },
         projectToGround: (x, y) => projectToGround(x, y),
-        estimateGroundPlane: (a, b, dt) => estimateGroundPlane(a, b, dt),
+        linFit: (ts, vs) => linFit(ts, vs),
+        fitSpeed2D: (pts, gx, gy) => fitSpeed2D(pts, gx, gy),
+        trackWindow: (h, t) => trackWindow(h, t),
+        estimateSpeed: (pts, cls) => estimateSpeed(pts, cls),
+        estimateGroundPlane: (pts) => estimateGroundPlane(pts),
         recordFovSample: (t) => recordFovSample(t),
         getFov: () => FOV_H_DEG,
-        setFov(d) { FOV_H_DEG = d; }
+        setFov(d) { FOV_H_DEG = d; },
+        pyramidFromCanvas: (c, w, h) => pyramidFromCanvas(c, w, h),
+        lkTrack: (p, c, x, y) => lkTrack(p, c, x, y),
+        detectFeatures: (p, b) => detectFeatures(p, b),
+        median: (a) => median(a),
+        flowState: () => flow,
+        flowReset: () => flowReset()
       };
     </script>
   </body>
