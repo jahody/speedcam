@@ -43,9 +43,9 @@ Fix the error sources that need no new calibration:
 - [x] Quality gating: discard tracks that are too short, too noisy, or partially occluded instead of averaging bad data in.
 
 ### Phase 2 (web) — automatic calibration
-- Pixel 8a (and friends) **intrinsics lookup table**; keep statistical FOV auto-tune only as fallback for unknown devices.
-- **Automatic camera-height estimation** from the car-size distribution across accumulated tracks (removes the last manual input).
-- Optional: **lane-marking detection** for in-scene metric scale.
+- [x] Pixel 8a (and friends) **intrinsics lookup table**; keep statistical FOV auto-tune only as fallback for unknown devices. (Pixel 6–9 main cameras ≈25 mm equivalent → 70° horizontal at 16:9; FOV is locked on these devices.)
+- [x] **Automatic camera-height estimation** from the car-size distribution across accumulated tracks (removes the last manual input). On locked-FOV devices the car-size statistics tune height instead of FOV; the manual entry is only a starting guess, and editing it resets the auto-tune.
+- [ ] Optional: **lane-marking detection** for in-scene metric scale.
 
 ### Phase 3 (web) — audio Doppler fusion
 - Microphone capture + FFT around each vehicle's closest approach; extract the Doppler curve and solve for speed.

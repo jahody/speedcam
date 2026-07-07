@@ -590,12 +590,29 @@
       let PIXELS_PER_METER = parseFloat(localStorage.getItem('pixelsPerMeter') || '0');
       let MAPY_API_KEY = localStorage.getItem('mapyApiKey') || '';
 
-      // IMU ground-plane: camera height above the road surface (meters), entered once by the user
+      // IMU ground-plane: camera height above the road surface (meters). Starting guess from
+      // the user; on known devices it is auto-tuned from passing cars (see recordScaleSample).
       let CAMERA_HEIGHT_M = parseFloat(localStorage.getItem('cameraHeight') || '1.5');
-      // Horizontal field of view across the sensor's long side. 70° matches the Pixel 8a main
-      // camera (~80° diagonal at 16:9). Auto-tuned over time from passing cars (see recordFovSample).
+      let HEIGHT_AUTO = localStorage.getItem('heightAuto') === '1';
+      let heightSamples = JSON.parse(localStorage.getItem('heightSizeSamples') || '[]');
+
+      // Horizontal field of view across the sensor's long side. Known devices get a fixed
+      // value from detectDeviceFov(); unknown devices start at 70° and auto-tune from
+      // passing cars (see recordScaleSample).
       let FOV_H_DEG = parseFloat(localStorage.getItem('fovHorizontalDeg') || '70');
       const FOV_MIN_DEG = 55, FOV_MAX_DEG = 85;
+
+      // Main-camera horizontal FOV for known devices (16:9 video). Recent Pixel (6-9,
+      // incl. a/Pro) main cameras are ~25 mm equivalent = ~82° diagonal, which is ~70°
+      // horizontal at 16:9 (Pixel 8a: 64 MP IMX787, 25 mm equiv per GSMArena). When the
+      // device is known, FOV is locked and the car-size statistics tune camera height instead.
+      function detectDeviceFov() {
+        if (/Pixel [6-9]/.test(navigator.userAgent)) return 70;
+        return null;
+      }
+      const DEVICE_FOV = detectDeviceFov();
+      let FOV_LOCKED = DEVICE_FOV !== null;
+      if (FOV_LOCKED) FOV_H_DEG = DEVICE_FOV;
       const MIN_GRAZE_SIN = Math.sin(2 * Math.PI / 180); // rays within 2° of the horizon are unreliable
       const MAX_GROUND_RANGE_M = 60;
       const ORIENT_EMA = 0.15;
@@ -708,19 +725,26 @@
         // Camera height (ground-plane method)
         const heightInput = document.getElementById('camera-height');
         heightInput.value = CAMERA_HEIGHT_M;
-        heightInput.onchange = (e) => {
-          CAMERA_HEIGHT_M = parseFloat(e.target.value) || 1.5;
+        // A manual height entry asserts new ground truth: discard auto-tune state
+        const setManualHeight = (h) => {
+          CAMERA_HEIGHT_M = h;
+          heightInput.value = h;
           localStorage.setItem('cameraHeight', CAMERA_HEIGHT_M);
+          HEIGHT_AUTO = false;
+          heightSamples = [];
+          localStorage.removeItem('heightAuto');
+          localStorage.removeItem('heightSizeSamples');
           updateCalStatus();
         };
+        heightInput.onchange = (e) => setManualHeight(parseFloat(e.target.value) || 1.5);
         document.querySelectorAll('.preset-h').forEach(btn => {
-          btn.onclick = () => {
-            CAMERA_HEIGHT_M = parseFloat(btn.dataset.h);
-            heightInput.value = CAMERA_HEIGHT_M;
-            localStorage.setItem('cameraHeight', CAMERA_HEIGHT_M);
-            updateCalStatus();
-          };
+          btn.onclick = () => setManualHeight(parseFloat(btn.dataset.h));
         });
+        if (FOV_LOCKED) {
+          // Known camera: height refines itself from passing cars, entry is just a head start
+          const hint = heightInput.closest('.setting-group').querySelector('.hint');
+          if (hint) hint.textContent = 'Starting guess is enough — this device\'s camera is known, so height refines itself automatically as cars pass.';
+        }
 
         initOrientation();
         updateCalStatus();
@@ -1263,7 +1287,7 @@
       // ===== SAVE MEASUREMENT =====
       function finalizeAndSave() {
         if (!trackedObject) return;
-        recordFovSample(trackedObject);
+        recordScaleSample(trackedObject);
         if (!trackedObject.finalSpeed) return;
         const speed = trackedObject.finalSpeed;
         if (speed < MIN_SPEED_KMH) return; // Ignore very slow movements
@@ -1398,9 +1422,11 @@
           badge.textContent = 'Calibrated ✓ (manual)';
           if (statusEl) statusEl.textContent = `Manual calibration — ${Math.round(PIXELS_PER_METER)} px/m`;
         } else if (imuReady) {
+          const hTxt = `${(+CAMERA_HEIGHT_M).toFixed(HEIGHT_AUTO ? 2 : 1)} m${HEIGHT_AUTO ? ' (auto)' : ''}`;
+          const fovTxt = `FOV ${FOV_H_DEG.toFixed(1)}° ${FOV_LOCKED ? '(device)' : '(auto-tuned)'}`;
           badge.style.display = 'block';
-          badge.textContent = `Ground-plane ✓ h=${CAMERA_HEIGHT_M} m`;
-          if (statusEl) statusEl.textContent = `Ground-plane active — motion sensors + ${CAMERA_HEIGHT_M} m camera height (FOV ${FOV_H_DEG.toFixed(1)}°)`;
+          badge.textContent = `Ground-plane ✓ h=${hTxt}`;
+          if (statusEl) statusEl.textContent = `Ground-plane active — motion sensors + ${hTxt} camera height (${fovTxt})`;
         } else if (imu.needsTap) {
           badge.style.display = 'block';
           badge.textContent = 'Tap to enable motion sensors';
@@ -1516,10 +1542,12 @@
         return { lat, depth, zCam: t * (f / rn) };
       }
 
-      // FOV auto-tune: each finalized side-on car track implies a real car length from its box
-      // width and projected distance. The median over many cars nudges the stored FOV — a
-      // per-device constant that converges once and persists.
-      function recordFovSample(track) {
+      // Scale auto-tune: each finalized side-on car track implies a real car length from its
+      // box width and projected distance. The scale error this reveals is attributed to the
+      // one unknown geometry parameter: camera height when the device FOV is known (locked),
+      // FOV otherwise. The median over many cars nudges that parameter; it converges once
+      // and persists.
+      function recordScaleSample(track) {
         if (track.vehicleClass !== 'car' || PIXELS_PER_METER > 0) return;
         const pts = track.history.filter(p => p.g);
         if (pts.length < 6) return;
@@ -1531,8 +1559,7 @@
         const f = focalLengthPx();
         const scaleX = canvas.width / (video.videoWidth || 1);
         const longSide = Math.max(video.videoWidth, video.videoHeight) || 1920;
-        // Store the FOV-independent measurement (box width x distance, normalized by
-        // resolution) so past samples stay valid as the FOV estimate changes
+        // q is box width x distance normalized by resolution; implied car length = q*longSide/f
         const qs = pts
           .map(p => (p.w / scaleX) * p.g.zCam / longSide)
           .filter(q => { const s = q * longSide / f; return s > 2 && s < 10; })
@@ -1540,6 +1567,31 @@
         if (!qs.length) return;
         const qMed = qs[Math.floor(qs.length / 2)];
 
+        if (FOV_LOCKED) {
+          // FOV known exactly -> residual scale error is camera height (zCam scales with h).
+          // Store height-normalized samples so they stay valid as the height estimate moves.
+          heightSamples.push(qMed / CAMERA_HEIGHT_M);
+          if (heightSamples.length > 40) heightSamples.shift();
+          localStorage.setItem('heightSizeSamples', JSON.stringify(heightSamples));
+
+          if (heightSamples.length >= 8) {
+            const sorted = [...heightSamples].sort((x, y) => x - y);
+            const med = sorted[Math.floor(sorted.length / 2)];
+            // Height that would make the median car exactly 4.5 m long
+            const target = 4.5 * f / (med * longSide);
+            CAMERA_HEIGHT_M += 0.2 * (target - CAMERA_HEIGHT_M);
+            CAMERA_HEIGHT_M = Math.min(12, Math.max(0.5, CAMERA_HEIGHT_M));
+            HEIGHT_AUTO = true;
+            localStorage.setItem('cameraHeight', CAMERA_HEIGHT_M);
+            localStorage.setItem('heightAuto', '1');
+            const hi = document.getElementById('camera-height');
+            if (hi) hi.value = CAMERA_HEIGHT_M.toFixed(2);
+            updateCalStatus();
+          }
+          return;
+        }
+
+        // Unknown device: store the FOV-independent measurement and tune FOV instead
         fovImpliedSamples.push(qMed);
         if (fovImpliedSamples.length > 40) fovImpliedSamples.shift();
         localStorage.setItem('fovSizeSamples', JSON.stringify(fovImpliedSamples));
@@ -1741,9 +1793,12 @@
         trackWindow: (h, t) => trackWindow(h, t),
         estimateSpeed: (pts, cls) => estimateSpeed(pts, cls),
         estimateGroundPlane: (pts) => estimateGroundPlane(pts),
-        recordFovSample: (t) => recordFovSample(t),
+        recordScaleSample: (t) => recordScaleSample(t),
         getFov: () => FOV_H_DEG,
         setFov(d) { FOV_H_DEG = d; },
+        setFovLocked(v) { FOV_LOCKED = v; },
+        getHeight: () => CAMERA_HEIGHT_M,
+        isHeightAuto: () => HEIGHT_AUTO,
         pyramidFromCanvas: (c, w, h) => pyramidFromCanvas(c, w, h),
         lkTrack: (p, c, x, y) => lkTrack(p, c, x, y),
         detectFeatures: (p, b) => detectFeatures(p, b),
