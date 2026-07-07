@@ -649,6 +649,22 @@
       const FLOW_BLEND = 0.06;     // slow pull toward detection centroid (kills drift)
       const FLOW_STALE_MS = 250;   // reset flow when frames stop coming (detection dropout)
 
+      // Audio Doppler: broadband tire/engine noise shifts down in pitch as a car passes.
+      // In log-frequency space the shift is a pure translation, so cross-correlating the
+      // averaged spectrum before vs after closest approach yields the frequency ratio R,
+      // and with the pass geometry (from the vision track) the speed: v = c(R-1)/(mu(R+1)).
+      const SOUND_SPEED = 343;          // m/s at ~20°C
+      const DOPPLER_FMIN = 300;         // analysis band (Hz) — tire/engine noise
+      const DOPPLER_FMAX = 8000;
+      const DOPPLER_LOG_BINS = 256;     // log-frequency resampling resolution
+      const DOPPLER_MAX_LAG = 25;       // correlation search range (log bins, ~±180 km/h)
+      const DOPPLER_BUF_S = 8;          // rolling spectrum buffer length (seconds)
+      const DOPPLER_WIN_GAP_S = 0.25;   // skip around closest approach (shift crosses zero)
+      const DOPPLER_WIN_LEN_S = 1.25;   // approach/recede window length
+      const DOPPLER_MIN_SPECTRA = 5;    // min spectra per window
+      const DOPPLER_MIN_MU = 0.25;      // min |geometry factor| — too perpendicular = no shift
+      const DOPPLER_MIN_CORR = 0.4;     // min spectral correlation to trust the shift
+
       // ===== STATE =====
       let model = null;
       let video, canvas, ctx;
@@ -661,6 +677,11 @@
       // Optical-flow tracker state (virtual vehicle position in canvas coords)
       let flow = { prevPyr: null, feats: [], pos: null, lastWall: 0, lastD: { x: 0, y: 0 } };
       let flowCanvas = null, flowCtx = null;
+
+      // Audio Doppler state: rolling buffer of log-frequency spectra { t (wall ms), s }
+      let audio = { ctx: null, analyser: null, bins: null, active: false, spectra: [] };
+      // Implied true camera heights from Doppler/vision speed ratios (see recordDopplerScale)
+      let dopplerHeightSamples = JSON.parse(localStorage.getItem('dopplerHeightSamples') || '[]');
 
       // Tracking state
       let trackedObject = null; // { history: [{x, y, w, h, t, wall, g}], finalSpeed: null, vehicleClass }
@@ -732,8 +753,10 @@
           localStorage.setItem('cameraHeight', CAMERA_HEIGHT_M);
           HEIGHT_AUTO = false;
           heightSamples = [];
+          dopplerHeightSamples = [];
           localStorage.removeItem('heightAuto');
           localStorage.removeItem('heightSizeSamples');
+          localStorage.removeItem('dopplerHeightSamples');
           updateCalStatus();
         };
         heightInput.onchange = (e) => setManualHeight(parseFloat(e.target.value) || 1.5);
@@ -784,6 +807,7 @@
 
         document.getElementById('loading').classList.add('hidden');
         isRunning = true;
+        initAudio(); // fire-and-forget: Doppler is optional, app works without the mic
         startDetectLoop();
         fetchLocationContext();
       }
@@ -813,6 +837,7 @@
       // tCap: capture time of this frame in ms (media timeline with rVFC, else wall clock)
       async function processFrame(tCap) {
         const wall = performance.now();
+        captureSpectrum(wall);
 
         // Calculate FPS
         frameCount++;
@@ -991,7 +1016,7 @@
           ssr += r * r;
         }
         const se = Math.sqrt(ssr / Math.max(1, n - 2) / stt);
-        return { slope, se };
+        return { slope, se, intercept: vm - slope * tm };
       }
 
       // 2D speed (m/s) from independent x(t), y(t) fits; error combined via delta method
@@ -1284,6 +1309,180 @@
         return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
       }
 
+      // ===== AUDIO DOPPLER =====
+      // Retrospective per-pass speed from the microphone: vision supplies the pass geometry
+      // (closest-approach time/distance from the ground-plane track), audio supplies the
+      // calibration-free speed scale. Runs ~2.5s after a record is saved and annotates it.
+
+      async function initAudio() {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            // Raw audio: browser "enhancements" would fight the Doppler measurement
+            audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+          });
+          audio.ctx = new AudioContext();
+          const src = audio.ctx.createMediaStreamSource(stream);
+          audio.analyser = audio.ctx.createAnalyser();
+          audio.analyser.fftSize = 4096;
+          audio.analyser.smoothingTimeConstant = 0; // raw snapshots, no time smearing
+          src.connect(audio.analyser);
+          audio.bins = new Float32Array(audio.analyser.frequencyBinCount);
+          audio.active = true;
+          // Some browsers keep the context suspended until a user gesture
+          if (audio.ctx.state === 'suspended') {
+            const resume = () => { audio.ctx.resume(); };
+            document.addEventListener('touchstart', resume, { once: true });
+            document.addEventListener('click', resume, { once: true });
+          }
+        } catch (e) {
+          console.warn('Doppler disabled (no microphone):', e);
+        }
+      }
+
+      // Snapshot the current spectrum onto a uniform log-frequency grid (rolling buffer)
+      function captureSpectrum(wall) {
+        if (!audio.active || audio.ctx.state !== 'running') return;
+        audio.analyser.getFloatFrequencyData(audio.bins);
+        const sr = audio.ctx.sampleRate;
+        const nb = audio.bins.length;
+        const lmin = Math.log(DOPPLER_FMIN), lmax = Math.log(Math.min(DOPPLER_FMAX, sr / 2));
+        const s = new Float32Array(DOPPLER_LOG_BINS);
+        for (let i = 0; i < DOPPLER_LOG_BINS; i++) {
+          const f = Math.exp(lmin + (lmax - lmin) * i / (DOPPLER_LOG_BINS - 1));
+          const b = f / (sr / 2) * nb;
+          const b0 = Math.floor(b), fr = b - b0;
+          s[i] = audio.bins[b0] * (1 - fr) + audio.bins[Math.min(nb - 1, b0 + 1)] * fr;
+        }
+        audio.spectra.push({ t: wall, s });
+        const cutoff = wall - DOPPLER_BUF_S * 1000;
+        while (audio.spectra.length && audio.spectra[0].t < cutoff) audio.spectra.shift();
+      }
+
+      // Average a list of spectra and remove the mean (correlation cares about shape only)
+      function avgSpectrum(list) {
+        const n = list[0].s.length;
+        const m = new Float32Array(n);
+        for (const sp of list) for (let i = 0; i < n; i++) m[i] += sp.s[i];
+        let mean = 0;
+        for (let i = 0; i < n; i++) { m[i] /= list.length; mean += m[i]; }
+        mean /= n;
+        for (let i = 0; i < n; i++) m[i] -= mean;
+        return m;
+      }
+
+      // Best shift of A relative to B in log-frequency bins (positive = A is higher pitch),
+      // by normalized cross-correlation with sub-bin parabolic refinement
+      function logSpecShift(A, B) {
+        const n = A.length;
+        const corrAt = (lag) => {
+          let sa = 0, sb = 0, sab = 0, saa = 0, sbb = 0, cnt = 0;
+          for (let i = 0; i < n; i++) {
+            const j = i - lag;
+            if (j < 0 || j >= n) continue;
+            const a = A[i], b = B[j];
+            sa += a; sb += b; sab += a * b; saa += a * a; sbb += b * b; cnt++;
+          }
+          if (cnt < 32) return -2;
+          const cov = sab - sa * sb / cnt;
+          const va = saa - sa * sa / cnt, vb = sbb - sb * sb / cnt;
+          return (va > 0 && vb > 0) ? cov / Math.sqrt(va * vb) : -2;
+        };
+        const cs = [];
+        let best = 0, bestC = -2;
+        for (let lag = -DOPPLER_MAX_LAG; lag <= DOPPLER_MAX_LAG; lag++) {
+          const c = corrAt(lag);
+          cs.push(c);
+          if (c > bestC) { bestC = c; best = lag; }
+        }
+        let delta = 0;
+        const i = best + DOPPLER_MAX_LAG;
+        if (i > 0 && i < cs.length - 1) {
+          const den = cs[i - 1] - 2 * cs[i] + cs[i + 1];
+          if (Math.abs(den) > 1e-9) delta = 0.5 * (cs[i - 1] - cs[i + 1]) / den;
+        }
+        return { shift: best + delta, corr: bestC };
+      }
+
+      // Doppler speed for a finished track, or null when the measurement isn't trustworthy.
+      // Returns { speedKmh, corr, mu, d }.
+      function estimateDoppler(track) {
+        if (!audio.active) return null;
+        const gp = track.history.filter(p => p.g);
+        if (gp.length < MIN_TRACK_POINTS) return null;
+
+        // Straight-line constant-velocity fit of the pass on the ground plane (wall clock,
+        // seconds — audio timestamps are wall clock)
+        const ts = gp.map(p => p.wall / 1000);
+        const fl = linFit(ts, gp.map(p => p.g.lat));
+        const fd = linFit(ts, gp.map(p => p.g.depth));
+        if (!fl || !fd) return null;
+        const v = Math.hypot(fl.slope, fd.slope);
+        if (v < 1) return null;
+        // Closest approach: point on the fitted line nearest the camera (origin)
+        const tCa = -(fl.intercept * fl.slope + fd.intercept * fd.slope) / (v * v);
+        const d = Math.hypot(fl.intercept + fl.slope * tCa, fd.intercept + fd.slope * tCa);
+        if (!(d > 0.5)) return null;
+        // Signed geometry factor: range rate = v * gof(t); negative approaching
+        const gof = (t) => { const u = v * (t - tCa); return u / Math.hypot(d, u); };
+
+        const winA = [tCa - DOPPLER_WIN_GAP_S - DOPPLER_WIN_LEN_S, tCa - DOPPLER_WIN_GAP_S];
+        const winB = [tCa + DOPPLER_WIN_GAP_S, tCa + DOPPLER_WIN_GAP_S + DOPPLER_WIN_LEN_S];
+        const grab = (w) => audio.spectra.filter(sp => sp.t / 1000 >= w[0] && sp.t / 1000 <= w[1]);
+        const A = grab(winA), B = grab(winB);
+        if (A.length < DOPPLER_MIN_SPECTRA || B.length < DOPPLER_MIN_SPECTRA) return null;
+
+        const muOf = (list) => list.reduce((acc, sp) => acc + Math.abs(gof(sp.t / 1000)), 0) / list.length;
+        const mu = (muOf(A) + muOf(B)) / 2;
+        if (mu < DOPPLER_MIN_MU) return null;
+
+        const { shift, corr } = logSpecShift(avgSpectrum(A), avgSpectrum(B));
+        if (corr < DOPPLER_MIN_CORR) return null;
+        const lstep = Math.log(DOPPLER_FMAX / DOPPLER_FMIN) / (DOPPLER_LOG_BINS - 1);
+        const R = Math.exp(shift * lstep); // f_approach / f_recede
+        if (R <= 1) return null; // approach must be higher pitch — otherwise it's not this car
+        const speedKmh = SOUND_SPEED * (R - 1) / (mu * (R + 1)) * 3.6;
+        if (speedKmh < MIN_SPEED_KMH || speedKmh > MAX_SPEED_KMH) return null;
+        return { speedKmh, corr, mu, d };
+      }
+
+      // Runs after the recede window has been captured; annotates the saved record and
+      // feeds the height auto-calibration
+      function scheduleDoppler(track, rec) {
+        if (!audio.active) return;
+        setTimeout(() => {
+          const est = estimateDoppler(track);
+          if (!est) return;
+          rec.dopplerKmh = Math.round(est.speedKmh * 10) / 10;
+          try { localStorage.setItem('speedRecords', JSON.stringify(records)); } catch (e) {}
+          showToast(`Doppler: ${Math.round(est.speedKmh)} km/h (camera ${Math.round(rec.speedKmh)})`);
+          recordDopplerScale(rec, est.speedKmh);
+        }, 2500);
+      }
+
+      // Ground-plane vision speeds scale linearly with camera height, so the Doppler/vision
+      // ratio directly implies the true height — a stronger signal than car-length statistics
+      // (recordScaleSample defers to this once enough samples exist).
+      function recordDopplerScale(rec, dopplerKmh) {
+        if (!FOV_LOCKED || PIXELS_PER_METER > 0) return;
+        if (rec.source !== 'imu') return; // ratio only calibrates the ground-plane estimator
+        const ratio = dopplerKmh / rec.speedKmh;
+        if (!(ratio > 0.5 && ratio < 2)) return;
+        dopplerHeightSamples.push(CAMERA_HEIGHT_M * ratio); // implied true height
+        if (dopplerHeightSamples.length > 30) dopplerHeightSamples.shift();
+        localStorage.setItem('dopplerHeightSamples', JSON.stringify(dopplerHeightSamples));
+        if (dopplerHeightSamples.length >= 5) {
+          const target = median(dopplerHeightSamples);
+          CAMERA_HEIGHT_M += 0.25 * (target - CAMERA_HEIGHT_M);
+          CAMERA_HEIGHT_M = Math.min(12, Math.max(0.5, CAMERA_HEIGHT_M));
+          HEIGHT_AUTO = true;
+          localStorage.setItem('cameraHeight', CAMERA_HEIGHT_M);
+          localStorage.setItem('heightAuto', '1');
+          const hi = document.getElementById('camera-height');
+          if (hi) hi.value = CAMERA_HEIGHT_M.toFixed(2);
+          updateCalStatus();
+        }
+      }
+
       // ===== SAVE MEASUREMENT =====
       function finalizeAndSave() {
         if (!trackedObject) return;
@@ -1317,9 +1516,11 @@
         const record = {
           speedKmh: Math.round(speed * 10) / 10,
           errKmh: trackedObject.finalErr ? Math.round(trackedObject.finalErr * 10) / 10 : null,
+          source: trackedObject.lastSource || null,
           timestamp: Date.now(),
           photo: photoDataUrl
         };
+        scheduleDoppler(trackedObject, record);
 
         records.unshift(record);
         if (records.length > 50) records = records.slice(0, 50); // limit local storage
@@ -1364,7 +1565,7 @@
         ${photoHtml}
         <div>
           <div class="history-speed ${isOver ? 'over-limit' : ''}">${Math.round(r.speedKmh)} km/h${r.errKmh ? ` <span style="font-size:14px;color:#888">±${Math.max(1, Math.round(r.errKmh))}</span>` : ''}</div>
-          <div class="history-time">${formatTime(r.timestamp)}</div>
+          <div class="history-time">${formatTime(r.timestamp)}${r.dopplerKmh ? ` • 🔊 ${Math.round(r.dopplerKmh)} km/h Doppler` : ''}</div>
         </div>
       `;
             list.appendChild(item);
@@ -1568,6 +1769,9 @@
         const qMed = qs[Math.floor(qs.length / 2)];
 
         if (FOV_LOCKED) {
+          // Doppler height calibration is per-pass physics — once it has enough samples,
+          // it owns the height and the weaker car-length statistic stands down
+          if (dopplerHeightSamples.length >= 5) return;
           // FOV known exactly -> residual scale error is camera height (zCam scales with h).
           // Store height-normalized samples so they stay valid as the height estimate moves.
           heightSamples.push(qMed / CAMERA_HEIGHT_M);
@@ -1799,6 +2003,12 @@
         setFovLocked(v) { FOV_LOCKED = v; },
         getHeight: () => CAMERA_HEIGHT_M,
         isHeightAuto: () => HEIGHT_AUTO,
+        audio,
+        setAudioActive(v) { audio.active = v; },
+        logSpecShift: (a, b) => logSpecShift(a, b),
+        avgSpectrum: (l) => avgSpectrum(l),
+        estimateDoppler: (t) => estimateDoppler(t),
+        recordDopplerScale: (r, d) => recordDopplerScale(r, d),
         pyramidFromCanvas: (c, w, h) => pyramidFromCanvas(c, w, h),
         lkTrack: (p, c, x, y) => lkTrack(p, c, x, y),
         detectFeatures: (p, b) => detectFeatures(p, b),

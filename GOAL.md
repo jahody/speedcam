@@ -48,8 +48,8 @@ Fix the error sources that need no new calibration:
 - [ ] Optional: **lane-marking detection** for in-scene metric scale.
 
 ### Phase 3 (web) — audio Doppler fusion
-- Microphone capture + FFT around each vehicle's closest approach; extract the Doppler curve and solve for speed.
-- Fuse Doppler and vision estimates (Doppler as the unbiased anchor, vision for per-vehicle association and coverage); use disagreement to auto-correct camera geometry over time.
+- [x] Microphone capture + FFT around each vehicle's closest approach; extract the Doppler curve and solve for speed. (Rolling log-frequency spectrum buffer; the pass geometry — closest-approach time, distance, angle factor μ — comes from the vision ground-plane track; speed from the log-spectral shift between approach and recede windows: v = c(R−1)/(μ(R+1)). Runs retrospectively ~2.5 s after each save and annotates the record.)
+- [x] Fuse Doppler and vision estimates (Doppler as the unbiased anchor, vision for per-vehicle association and coverage); use disagreement to auto-correct camera geometry over time. (Doppler/vision speed ratios imply the true camera height; with ≥5 samples this supersedes the car-length height statistic.)
 
 ### Phase 4 (native Android) — exact geometry
 - Android app (Camera2 + ARCore) sharing the estimation/fusion logic: exact intrinsics, 6-DoF pose, detected road plane, nanosecond frame timestamps.
