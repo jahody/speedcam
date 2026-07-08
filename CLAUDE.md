@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 See `GOAL.md` for the project mission (near-radar accuracy with automatic calibration) and the phased roadmap.
 
+Two implementations share the same estimation concepts:
+- **Web app** (`index.html`) — described below; zero-install entry point.
+- **Native Android app** (`android/`) — the accuracy flagship: exact Camera2 intrinsics, gravity-sensor ground plane, TFLite detection. Estimation math lives in the pure-Kotlin `android/core` module (`gradlew :core:test` runs without an Android SDK); the tests pin the Kotlin ports to the web implementation's verified vectors. See `android/README.md`.
+
 SpeedCam Mobile — a single-page, single-file web app (`index.html`) that uses a phone's rear camera plus TensorFlow.js (COCO-SSD) to detect passing vehicles and estimate their speed in real time. Everything — HTML, CSS, and JS — lives in `index.html`; there is no build step, package.json, or bundler.
 
 ## Running it

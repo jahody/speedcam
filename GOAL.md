@@ -52,7 +52,8 @@ Fix the error sources that need no new calibration:
 - [x] Fuse Doppler and vision estimates (Doppler as the unbiased anchor, vision for per-vehicle association and coverage); use disagreement to auto-correct camera geometry over time. (Doppler/vision speed ratios imply the true camera height; with ≥5 samples this supersedes the car-length height statistic.)
 
 ### Phase 4 (native Android) — exact geometry
-- Android app (Camera2 + ARCore) sharing the estimation/fusion logic: exact intrinsics, 6-DoF pose, detected road plane, nanosecond frame timestamps.
+- [x] Android app sharing the estimation/fusion logic (see `android/`): exact intrinsics from Camera2 (`LENS_INFO_AVAILABLE_FOCAL_LENGTHS` + `SENSOR_INFO_PHYSICAL_SIZE` — no FOV guessing), gravity-sensor ground plane, sensor-clock frame timestamps, TFLite EfficientDet-Lite0 detection, full regression + confidence pipeline, audio Doppler cross-check with height auto-calibration. The math lives in a pure-Kotlin `core` module unit-tested against the web implementation's verification vectors.
+- [ ] ARCore 6-DoF pose (handles camera translation, per-frame intrinsics) — future upgrade; v1 uses gravity + fixed height.
 - The web app remains the zero-install entry point; the native app is the accuracy flagship.
 
 ### Phase 5 — validation & error reporting
